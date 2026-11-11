@@ -19,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.window.Dialog
 import com.example.ui.theme.ChatGptEmerald
 
@@ -137,8 +138,11 @@ fun ChatGptSettingsDialog(
     isOpen: Boolean,
     selectedVoice: String,
     selectedPersona: String,
+    hasJarvisToken: Boolean = false,
     onVoiceChanged: (String) -> Unit,
     onPersonaChanged: (String) -> Unit,
+    onSaveJarvisToken: ((String, (Boolean) -> Unit) -> Unit)? = null,
+    onClearJarvisToken: (() -> Unit)? = null,
     onClearAllChats: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -267,6 +271,92 @@ fun ChatGptSettingsDialog(
                                     modifier = Modifier.size(16.dp)
                                 )
                             }
+                        }
+                    }
+                }
+
+                // Jarvis Backend Integration
+                Spacer(modifier = Modifier.height(20.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = "Jarvis Backend Integration",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (hasJarvisToken) "Status: ✅ Bearer token encrypted in Hardware Keystore (AES-GCM). Using SSE stream." else "Status: ⚠️ No Jarvis token. Falling back to direct GeminiApi.",
+                    fontSize = 11.sp,
+                    color = if (hasJarvisToken) ChatGptEmerald else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                var tokenInput by remember { mutableStateOf("") }
+                var tokenError by remember { mutableStateOf<String?>(null) }
+                var tokenSuccess by remember { mutableStateOf<String?>(null) }
+
+                OutlinedTextField(
+                    value = tokenInput,
+                    onValueChange = {
+                        tokenInput = it
+                        tokenError = null
+                        tokenSuccess = null
+                    },
+                    placeholder = { Text("Paste jv_... token (46 chars)", fontSize = 11.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ChatGptEmerald
+                    )
+                )
+
+                if (tokenError != null) {
+                    Text(tokenError!!, color = Color.Red, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                }
+                if (tokenSuccess != null) {
+                    Text(tokenSuccess!!, color = ChatGptEmerald, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            val trimmed = tokenInput.trim()
+                            if (!trimmed.matches(Regex("^jv_[A-Za-z0-9_-]{43}$"))) {
+                                tokenError = "Invalid format: must start with 'jv_' followed by 43 characters"
+                                return@Button
+                            }
+                            onSaveJarvisToken?.invoke(trimmed) { success ->
+                                if (success) {
+                                    tokenSuccess = "Token encrypted & saved in Keystore!"
+                                    tokenInput = ""
+                                } else {
+                                    tokenError = "Failed to store token securely"
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = ChatGptEmerald),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Save Token", fontSize = 12.sp)
+                    }
+
+                    if (hasJarvisToken) {
+                        OutlinedButton(
+                            onClick = {
+                                onClearJarvisToken?.invoke()
+                                tokenSuccess = "Token cleared. Reverted to direct Gemini."
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Clear Token", fontSize = 12.sp)
                         }
                     }
                 }

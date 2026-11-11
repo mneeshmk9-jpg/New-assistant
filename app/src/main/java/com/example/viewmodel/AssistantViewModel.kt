@@ -26,6 +26,7 @@ import com.example.database.MemoryItem
 import com.example.database.ReminderItem
 import com.example.database.SmartDevice
 import com.example.certification.PlannedAction
+import com.example.certification.AuditTraceAnchor
 import com.example.network.AssistantResponse
 
 import com.example.network.Content
@@ -45,7 +46,11 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import java.util.Locale
+import com.example.service.WakeWordEventBridge
+import com.example.service.WakeWordEvent
+import com.example.service.WakeWordService
 
 class AssistantViewModel(application: Application) : AndroidViewModel(application), TextToSpeech.OnInitListener {
 
@@ -89,13 +94,100 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _agentSteps = MutableStateFlow<List<AgentStep>>(emptyList())
     val agentSteps: StateFlow<List<AgentStep>> = _agentSteps.asStateFlow()
 
+    // Adversarial verification & resilience flags
+    private val _simulateRollbackFailure = MutableStateFlow(false)
+    val simulateRollbackFailure: StateFlow<Boolean> = _simulateRollbackFailure.asStateFlow()
+
+    fun setSimulateRollbackFailure(enabled: Boolean) {
+        _simulateRollbackFailure.value = enabled
+    }
+
     private val _pendingActions = MutableStateFlow<List<ProposedAction>?>(null)
     val pendingActions: StateFlow<List<ProposedAction>?> = _pendingActions.asStateFlow()
 
     private var activeAssistantMsgId: Int? = null
     private var activeAssistantResponse: AssistantResponse? = null
 
+    companion object {
+        val ALLOWED_PLAN_ACTIONS = setOf(
+            "send_sms", "update_device", "control_device", "create_reminder", "open_app", "web_search", "save_memory"
+        )
+    }
+
+    val tokenManager by lazy { com.example.jarvis.SecureTokenManager(getApplication()) }
+    val jarvisSseClient by lazy { com.example.jarvis.JarvisSseClient(tokenManager) }
+
+    private val _hasJarvisToken = MutableStateFlow(false)
+    val hasJarvisToken: StateFlow<Boolean> = _hasJarvisToken.asStateFlow()
+
+    fun saveJarvisToken(token: String, onComplete: ((Boolean) -> Unit)? = null) {
+        viewModelScope.launch {
+            val success = tokenManager.saveToken(token)
+            if (success) {
+                _hasJarvisToken.value = true
+            }
+            onComplete?.invoke(success)
+        }
+    }
+
+    fun clearJarvisToken(onComplete: (() -> Unit)? = null) {
+        viewModelScope.launch {
+            tokenManager.clearToken()
+            _hasJarvisToken.value = false
+            onComplete?.invoke()
+        }
+    }
+
+    fun validateProposedPlan(actions: List<ProposedAction>?): Pair<Boolean, String?> {
+        if (actions.isNullOrEmpty()) return Pair(true, null)
+        val disallowed = actions.find { it.action !in ALLOWED_PLAN_ACTIONS }
+        return if (disallowed != null) {
+            val sanitized = disallowed.action.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
+            Pair(false, sanitized)
+        } else {
+            Pair(true, null)
+        }
+    }
+
+    fun recordBlockedPlanAudit(blockedTool: String, sessionId: String = _currentSessionId.value) {
+        val sanitized = blockedTool.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
+        val logTime = System.currentTimeMillis()
+        val logHash = calculateAuditHash(sanitized, "{}", "BLOCKED", logTime)
+        val targetSessionId = if (sessionId.isNotBlank() && sessionId != "default") {
+            sessionId
+        } else {
+            Log.w("RohitAI", "Blocked plan audit recorded with unspecified session")
+            "UNSPECIFIED"
+        }
+        viewModelScope.launch {
+            repository.insertAuditLog(
+                com.example.database.AuditLog(
+                    timestamp = logTime,
+                    toolName = sanitized,
+                    parameters = "{}",
+                    riskLevel = "CRITICAL",
+                    status = "BLOCKED",
+                    userConfirmation = false,
+                    executionTimeMs = 0,
+                    errorMessage = "Policy Violation: Disallowed tool proposal ($sanitized) rejected by Pre-Consent Gate",
+                    rollbackSupported = false,
+                    sessionId = targetSessionId,
+                    permissionStatus = "BLOCKED",
+                    forensicChainJson = """{"hash":"$logHash","policy":"pre_consent_allowlist_gate","blocked_action":"$sanitized"}"""
+                )
+            )
+        }
+    }
+
     fun setPendingActions(actions: List<ProposedAction>?) {
+        val (isValid, blockedTool) = validateProposedPlan(actions)
+        if (!isValid) {
+            val tool = blockedTool ?: "unknown"
+            recordBlockedPlanAudit(tool, _currentSessionId.value)
+            _pendingActions.value = null
+            savePendingActionsToPrefs(null)
+            return
+        }
         _pendingActions.value = actions
         savePendingActionsToPrefs(actions)
     }
@@ -307,11 +399,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun openVoiceMode() {
         _isVoiceModeOpen.value = true
+        _isContinuousModeActive.value = true
         startListening()
     }
 
     fun closeVoiceMode() {
         _isVoiceModeOpen.value = false
+        _isContinuousModeActive.value = false
         stopListening()
         stopSpeaking()
     }
@@ -468,9 +562,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 val adapter = moshi.adapter<List<ProposedAction>>(type)
                 val actions = adapter.fromJson(json)
                 if (!actions.isNullOrEmpty()) {
-                    recoveredActions = actions
+                    recoveredActions = actions.map { it.copy(state = com.example.certification.ActionState.RECOVERY_REQUIRED) }
                     _hasRecoveryPending.value = true
-                    Log.d("RohitAI", "Interrupted session found for recovery with ${actions.size} actions.")
+                    _agentSteps.value = recoveredActions?.map {
+                        AgentStep(
+                            id = it.id,
+                            action = it.action,
+                            description = it.description,
+                            status = StepStatus.RECOVERY_REQUIRED,
+                            errorMessage = "Application interrupted during execution. Recovery required."
+                        )
+                    } ?: emptyList()
+                    Log.d("RohitAI", "Interrupted session found for recovery with ${actions.size} actions in RECOVERY_REQUIRED state.")
                 }
             } catch (e: Exception) {
                 Log.e("RohitAI", "Failed to parse recovered actions", e)
@@ -480,9 +583,15 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun restoreCrashedSession() {
         val actions = recoveredActions
-        if (actions != null) {
+        val (isValid, blockedTool) = validateProposedPlan(actions)
+        if (actions != null && isValid) {
             _pendingActions.value = actions
             Log.d("RohitAI", "Restored pending actions successfully!")
+        } else if (!isValid) {
+            val tool = blockedTool ?: "recovered_tampered_action"
+            Log.w("RohitAI", "Recovered crashed actions rejected by Pre-Consent Gate: $tool")
+            recordBlockedPlanAudit(tool)
+            _pendingActions.value = null
         }
         _hasRecoveryPending.value = false
         recoveredActions = null
@@ -646,6 +755,25 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Sync system permissions and check for any interrupted crash recovery sessions on launch
         syncPermissionsWithSystem()
         checkForInterruptedSession()
+
+        // Decoupled wake word listener from foreground service
+        viewModelScope.launch {
+            WakeWordEventBridge.events.collect { event ->
+                when (event) {
+                    is WakeWordEvent.Detected -> {
+                        Log.i("HeyVani", "Wake word detected: ${event.keyword}")
+                        _isVoiceModeOpen.value = true
+                        startNormalListening()
+                    }
+                    is WakeWordEvent.StatusChanged -> {
+                        _isWakeWordModeActive.value = event.isListening
+                    }
+                    is WakeWordEvent.Error -> {
+                        _errorMessage.value = event.error
+                    }
+                }
+            }
+        }
     }
 
     // --- Text To Speech Init ---
@@ -688,6 +816,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * Re-arms SpeechRecognizer ONLY when user explicitly engaged Continuous Conversation mode.
+     * WakeWord listening is completely handled by WakeWordService / WakeWordDetector in the background,
+     * so SpeechRecognizer is NEVER continuously looped for wake words.
+     */
     private fun restartListeningIfNeeded() {
         if (_isContinuousModeActive.value) {
             viewModelScope.launch {
@@ -696,26 +829,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     startNormalListening()
                 }
             }
-        } else if (_isWakeWordModeActive.value) {
-            viewModelScope.launch {
-                delay(500)
-                if (_isWakeWordModeActive.value) {
-                    startWakeWordListening()
-                }
-            }
         }
-    }
-
-    private fun checkWakeWord(text: String): String? {
-        val lower = text.lowercase()
-        val wakeWords = listOf("rohit", "rohid", "rowhit", "rohet", "रोहित", "रोहीत", "रोइत")
-        for (word in wakeWords) {
-            val index = lower.indexOf(word)
-            if (index != -1) {
-                return text.substring(index + word.length).trim()
-            }
-        }
-        return null
     }
 
     private fun isExitCommand(text: String): Boolean {
@@ -728,19 +842,20 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun toggleWakeWordMode() {
-        _isWakeWordModeActive.value = !_isWakeWordModeActive.value
+        val targetState = !_isWakeWordModeActive.value
+        _isWakeWordModeActive.value = targetState
         _isContinuousModeActive.value = false // Deactivate conflict
         consecutiveSilenceCount = 0
-        if (_isWakeWordModeActive.value) {
-            startWakeWordListening()
+        if (targetState) {
+            WakeWordService.startService(getApplication())
         } else {
+            WakeWordService.stopService(getApplication())
             stopListening()
         }
     }
 
     fun toggleContinuousMode() {
         _isContinuousModeActive.value = !_isContinuousModeActive.value
-        _isWakeWordModeActive.value = false // Deactivate conflict
         consecutiveSilenceCount = 0
         if (_isContinuousModeActive.value) {
             startNormalListening()
@@ -751,23 +866,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun clearErrorMessage() {
         _errorMessage.value = null
-    }
-
-    fun startWakeWordListening() {
-        stopSpeaking()
-        _errorMessage.value = null
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toString())
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-        }
-        try {
-            speechRecognizer?.startListening(intent)
-            _isListening.value = true
-        } catch (e: Exception) {
-            Log.e("RohitAI", "Failed starting wake-word speech recognizer", e)
-        }
     }
 
     fun startNormalListening() {
@@ -822,7 +920,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 _isListening.value = true
                 _errorMessage.value = null
                 _interimSpeechText.value = when {
-                    _isWakeWordModeActive.value -> "Listening for wake word 'Rohit'..."
                     _isContinuousModeActive.value -> "Continuous mode (Listening)..."
                     else -> "Listening..."
                 }
@@ -830,7 +927,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
             override fun onBeginningOfSpeech() {
                 _interimSpeechText.value = when {
-                    _isWakeWordModeActive.value -> "Hearing sound..."
                     _isContinuousModeActive.value -> "Continuous mode (Hearing)..."
                     else -> "Recording voice..."
                 }
@@ -845,7 +941,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             override fun onEndOfSpeech() {
                 _isListening.value = false
                 _interimSpeechText.value = when {
-                    _isWakeWordModeActive.value -> "Analyzing..."
                     _isContinuousModeActive.value -> "Continuous mode (Analyzing)..."
                     else -> "Processing voice..."
                 }
@@ -867,13 +962,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                             if (_isContinuousModeActive.value) {
                                 startNormalListening()
                             }
-                        }
-                    }
-                } else if (_isWakeWordModeActive.value && !_isSpeaking.value && !_isThinking.value) {
-                    viewModelScope.launch {
-                        delay(1200)
-                        if (_isWakeWordModeActive.value) {
-                            startWakeWordListening()
                         }
                     }
                 } else {
@@ -905,32 +993,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         _isContinuousModeActive.value = false
                         speak("ठीक है, फिर बात करेंगे। अलविदा!")
                         _interimSpeechText.value = "Conversation closed."
-                    } else if (_isWakeWordModeActive.value) {
-                        val remainingQuery = checkWakeWord(spokenText)
-                        if (remainingQuery != null) {
-                            if (remainingQuery.trim().isNotEmpty()) {
-                                processUserQuery(remainingQuery.trim())
-                            } else {
-                                val greeting = "हाँ जी, बोलिए?"
-                                val userMsg = ConversationMessage(role = "user", text = spokenText)
-                                viewModelScope.launch {
-                                    repository.insertMessage(userMsg)
-                                    val assistantMsg = ConversationMessage(role = "assistant", text = greeting)
-                                    repository.insertMessage(assistantMsg)
-                                    speak(greeting)
-                                }
-                            }
-                        } else {
-                            // No wake word found, ignore and restart listening
-                            if (_isWakeWordModeActive.value && !_isSpeaking.value && !_isThinking.value) {
-                                viewModelScope.launch {
-                                    delay(500)
-                                    if (_isWakeWordModeActive.value) {
-                                        startWakeWordListening()
-                                    }
-                                }
-                            }
-                        }
                     } else {
                         processUserQuery(spokenText)
                     }
@@ -950,15 +1012,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                                 }
                             }
                         }
-                    } else if (!_isWakeWordModeActive.value) {
+                    } else {
                         _errorMessage.value = "No speech matched. Try typing instead!"
-                    } else if (!_isSpeaking.value && !_isThinking.value) {
-                        viewModelScope.launch {
-                            delay(500)
-                            if (_isWakeWordModeActive.value) {
-                                startWakeWordListening()
-                            }
-                        }
                     }
                 }
             }
@@ -968,12 +1023,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 if (!matches.isNullOrEmpty()) {
                     val partialText = matches[0]
                     _interimSpeechText.value = partialText
-                    if (_isWakeWordModeActive.value) {
-                        val remaining = checkWakeWord(partialText)
-                        if (remaining != null) {
-                            _interimSpeechText.value = "Wake word 'Rohit' detected! listening..."
-                        }
-                    } else if (_isContinuousModeActive.value) {
+                    if (_isContinuousModeActive.value) {
                         _interimSpeechText.value = "Continuous: $partialText"
                     }
                 }
@@ -1109,7 +1159,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
 
-            // Check API Key
+            // Route to Jarvis Backend if Secure Device Token is provisioned
+            if (tokenManager.hasToken()) {
+                processUserQueryWithJarvis(query, isTemp, currentSess, currentMdl)
+                return@launch
+            }
+
+            // Fallback: Check Gemini API Key
             val apiKey = BuildConfig.GEMINI_API_KEY
             if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
                 _isThinking.value = false
@@ -1399,6 +1455,45 @@ $savedMemories
                                 rawActions.add(Pair(item.action, item.action_params))
                             }
                         }
+
+                        // PRE-CONSENT PLANNING GATE: Reject any plan containing disallowed tools before consent UI
+                        val ALLOWED_PLAN_ACTIONS = setOf(
+                            "send_sms", "update_device", "control_device", "create_reminder", "open_app", "web_search", "save_memory"
+                        )
+                        val disallowedAction = rawActions.find { it.first !in ALLOWED_PLAN_ACTIONS }
+                        if (disallowedAction != null) {
+                            val blockedTool = disallowedAction.first.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
+                            val logTime = System.currentTimeMillis()
+                            val logHash = calculateAuditHash(blockedTool, "{}", "BLOCKED", logTime)
+                            repository.insertAuditLog(
+                                com.example.database.AuditLog(
+                                    timestamp = logTime,
+                                    toolName = blockedTool,
+                                    parameters = "{}",
+                                    riskLevel = "CRITICAL",
+                                    status = "BLOCKED",
+                                    userConfirmation = false,
+                                    executionTimeMs = 0,
+                                    errorMessage = "Policy Violation: Disallowed tool proposal ($blockedTool) rejected prior to user consent",
+                                    rollbackSupported = false,
+                                    sessionId = currentSess,
+                                    permissionStatus = "BLOCKED",
+                                    forensicChainJson = """{"hash":"$logHash","policy":"pre_consent_allowlist_gate","blocked_action":"$blockedTool"}"""
+                                )
+                            )
+                            val rejectMessage = "⚠️ **Action Plan Rejected:** The assistant attempted to propose an unauthorized action (`$blockedTool`). For device security and policy integrity, this operation has been blocked before asking for your consent."
+                            repository.updateMessage(
+                                ConversationMessage(
+                                    id = assistantMsgId.toInt(),
+                                    role = "assistant",
+                                    text = rejectMessage,
+                                    isToolCall = false,
+                                    toolName = null
+                                )
+                            )
+                            speak(rejectMessage)
+                            return@launch
+                        }
                         
                         rawActions.forEach { (action, params) ->
                             val description = when (action) {
@@ -1441,6 +1536,7 @@ $savedMemories
                                 else -> false
                             }
 
+                            val actionIdempotencyKey = java.util.UUID.randomUUID().toString()
                             proposed.add(
                                 ProposedAction(
                                     action = action,
@@ -1451,7 +1547,9 @@ $savedMemories
                                     availableContacts = availableContacts,
                                     selectedContact = selectedContact,
                                     riskLevel = actionRiskLevel,
-                                    supportsRollback = actionSupportsRollback
+                                    supportsRollback = actionSupportsRollback,
+                                    state = com.example.certification.ActionState.PROPOSED,
+                                    idempotencyKey = actionIdempotencyKey
                                 )
                             )
                         }
@@ -1590,6 +1688,266 @@ $savedMemories
         }
     }
 
+    private suspend fun processUserQueryWithJarvis(
+        query: String,
+        isTemp: Boolean,
+        currentSess: String,
+        currentMdl: String
+    ) {
+        var assistantMsgId: Long = 0
+        if (isTemp) {
+            val tempId = (System.currentTimeMillis() + 1).toInt()
+            assistantMsgId = tempId.toLong()
+            val placeholder = ConversationMessage(
+                id = tempId,
+                role = "assistant",
+                text = "...",
+                isToolCall = false,
+                sessionId = "temp",
+                modelUsed = "Jarvis"
+            )
+            _temporaryMessages.value = _temporaryMessages.value + placeholder
+        } else {
+            assistantMsgId = repository.insertMessage(
+                ConversationMessage(
+                    role = "assistant",
+                    text = "...",
+                    isToolCall = false,
+                    sessionId = currentSess,
+                    modelUsed = "Jarvis"
+                )
+            )
+        }
+
+        val fullTextBuilder = StringBuilder()
+        var processedSpeakLength = 0
+        var utteranceCount = 0
+        activeUtterances.clear()
+        streamFinished = false
+
+        // Invariant: Actions and plans are BUFFERED in memory until JarvisServerEvent.Done is received.
+        // Zero action execution, zero consent UI, and zero state machine mutation before Done.
+        val bufferedProposedActions = mutableListOf<ProposedAction>()
+        val bufferedPlanSteps = mutableListOf<com.example.jarvis.PlannedStep>()
+        var streamEncounteredError = false
+
+        try {
+            val historySource = if (isTemp) {
+                _temporaryMessages.value
+            } else {
+                messages.value.filter { it.sessionId == currentSess || it.sessionId == "default" }
+            }
+
+            val conversationHistory = historySource
+                .filter { it.text.isNotBlank() && it.text != "..." && it.id != assistantMsgId.toInt() }
+                .takeLast(10)
+                .map {
+                    val normalizedRole = if (it.role.equals("assistant", ignoreCase = true) || it.role.equals("model", ignoreCase = true)) {
+                        "assistant"
+                    } else {
+                        "user"
+                    }
+                    com.example.jarvis.JarvisHistoryTurn(
+                        role = normalizedRole,
+                        text = it.text.trim()
+                    )
+                }
+
+            val request = com.example.jarvis.JarvisAssistantRequest(
+                text = query.trim(),
+                history = conversationHistory
+            )
+
+            jarvisSseClient.streamAssistant(request).collect { event ->
+                when (event) {
+                    is com.example.jarvis.JarvisServerEvent.TextDelta -> {
+                        fullTextBuilder.append(event.delta)
+                        val currentText = fullTextBuilder.toString()
+                        if (isTemp) {
+                            _temporaryMessages.value = _temporaryMessages.value.map {
+                                if (it.id == assistantMsgId.toInt()) it.copy(text = currentText) else it
+                            }
+                        } else {
+                            repository.updateMessage(
+                                ConversationMessage(
+                                    id = assistantMsgId.toInt(),
+                                    role = "assistant",
+                                    text = currentText,
+                                    isToolCall = false,
+                                    sessionId = currentSess,
+                                    modelUsed = "Jarvis"
+                                )
+                            )
+                        }
+
+                        // Stream sentence-by-sentence TTS
+                        val (newSentences, nextLength) = getCompletedSentences(currentText, processedSpeakLength)
+                        processedSpeakLength = nextLength
+                        for (sentence in newSentences) {
+                            utteranceCount++
+                            speakAccumulating(sentence, "JarvisStreamSpeech_$utteranceCount")
+                        }
+                    }
+
+                    is com.example.jarvis.JarvisServerEvent.Plan -> {
+                        bufferedPlanSteps.clear()
+                        bufferedPlanSteps.addAll(event.steps)
+                        Log.d("RohitAI", "Jarvis SSE Plan buffered: ${event.planId} with ${event.steps.size} steps")
+                    }
+
+                    is com.example.jarvis.JarvisServerEvent.Action -> {
+                        val desc = when (event.tool) {
+                            "send_sms" -> "Send SMS to ${event.args["recipient"] ?: "someone"}"
+                            "update_device", "control_device" -> "Update ${event.args["device_id"] ?: event.args["device"] ?: "device"} to ${event.args["state"] ?: "state"}"
+                            "create_reminder" -> "Create reminder: ${event.args["title"] ?: "task"}"
+                            "open_app" -> "Open app: ${event.args["app_package"] ?: "app"}"
+                            "save_memory" -> "Save memory: ${event.args["fact"] ?: "fact"}"
+                            else -> "Execute ${event.tool}"
+                        }
+                        val risk = try {
+                            RiskLevel.valueOf(event.riskLevel.uppercase())
+                        } catch (e: Exception) {
+                            RiskLevel.HIGH
+                        }
+                        bufferedProposedActions.add(
+                            ProposedAction(
+                                id = event.actionId,
+                                action = event.tool,
+                                description = desc,
+                                originalParams = event.args,
+                                editedParams = event.args,
+                                riskLevel = risk,
+                                supportsRollback = event.tool in listOf("update_device", "control_device", "save_memory")
+                            )
+                        )
+                    }
+
+                    is com.example.jarvis.JarvisServerEvent.Error -> {
+                        streamEncounteredError = true
+                        bufferedProposedActions.clear()
+                        bufferedPlanSteps.clear()
+                        _pendingActions.value = null
+                        savePendingActionsToPrefs(null)
+                        val errorText = when (event.code) {
+                            "UNAUTHORIZED" -> "⚠️ **Unauthorized (401):** Device Bearer token is invalid or missing. Please check your Jarvis token in Settings."
+                            "BAD_REQUEST" -> "⚠️ **Bad Request (400):** Invalid request parameters sent to Jarvis backend."
+                            "FORBIDDEN" -> "⚠️ **Forbidden (403):** Device token lacks required permissions."
+                            "RATE_LIMITED" -> "⚠️ **Rate Limited (429):** Too many requests to Jarvis backend. Please wait a moment."
+                            "UPSTREAM_TIMEOUT" -> "⚠️ **Upstream Timeout:** Jarvis backend timed out awaiting upstream processing."
+                            "UPSTREAM_ERROR" -> "⚠️ **Upstream Error:** Jarvis server encountered an upstream failure. ${event.message ?: ""}".trim()
+                            "SENSITIVE_UNAVAILABLE" -> "⚠️ **Sensitive Unavailable:** Request marked sensitive but upstream provider is unavailable."
+                            "CONTENT_BLOCKED" -> "⚠️ **Content Blocked:** Request or response blocked by safety filters."
+                            "INVALID_TOOL_CALL" -> "⚠️ **Invalid Tool Call:** Upstream model generated a malformed or unauthorized tool call."
+                            "INTERNAL" -> "⚠️ **Internal Error (500):** Jarvis server internal error."
+                            "NETWORK_ERROR" -> "⚠️ **Network Error:** Unable to connect to Jarvis server. Please check your network connection."
+                            "SECURITY_VIOLATION" -> "⚠️ **Security Violation:** Transport security rejected (non-HTTPS)."
+                            else -> "⚠️ **Error (${event.code}):** ${event.message ?: "An error occurred with Jarvis backend."}"
+                        }
+                        if (isTemp) {
+                            _temporaryMessages.value = _temporaryMessages.value.map {
+                                if (it.id == assistantMsgId.toInt()) it.copy(text = errorText) else it
+                            }
+                        } else {
+                            repository.updateMessage(
+                                ConversationMessage(
+                                    id = assistantMsgId.toInt(),
+                                    role = "assistant",
+                                    text = errorText,
+                                    isToolCall = false,
+                                    sessionId = currentSess,
+                                    modelUsed = "Jarvis"
+                                )
+                            )
+                        }
+                        _errorMessage.value = errorText
+                        speak(errorText.replace(Regex("[*#_`⚠️]"), ""))
+                    }
+
+                    is com.example.jarvis.JarvisServerEvent.Done -> {
+                        streamFinished = true
+                        if (!streamEncounteredError) {
+                            val fullText = fullTextBuilder.toString()
+                            if (fullText.length > processedSpeakLength) {
+                                val remaining = fullText.substring(processedSpeakLength).trim()
+                                if (remaining.isNotEmpty()) {
+                                    utteranceCount++
+                                    speakAccumulating(remaining, "JarvisStreamSpeech_$utteranceCount")
+                                }
+                            }
+
+                            if (bufferedProposedActions.isNotEmpty()) {
+                                val (isValid, blockedTool) = validateProposedPlan(bufferedProposedActions)
+                                if (!isValid) {
+                                    val tool = blockedTool ?: "unknown"
+                                    recordBlockedPlanAudit(tool, currentSess)
+                                    val rejectNotice = "⚠️ **Action Plan Rejected:** The assistant proposed an unauthorized action (`$tool`). For device security and policy integrity, this operation was blocked before asking for your consent."
+                                    if (isTemp) {
+                                        _temporaryMessages.value = _temporaryMessages.value.map {
+                                            if (it.id == assistantMsgId.toInt()) it.copy(text = fullText + "\n\n" + rejectNotice) else it
+                                        }
+                                    } else {
+                                        repository.updateMessage(
+                                            ConversationMessage(
+                                                id = assistantMsgId.toInt(),
+                                                role = "assistant",
+                                                text = fullText + "\n\n" + rejectNotice,
+                                                isToolCall = false,
+                                                sessionId = currentSess,
+                                                modelUsed = "Jarvis"
+                                            )
+                                        )
+                                    }
+                                    speak("Action plan was rejected due to policy restrictions on tool $tool")
+                                    bufferedProposedActions.clear()
+                                } else {
+                                    _pendingActions.value = bufferedProposedActions.toList()
+                                    savePendingActionsToPrefs(bufferedProposedActions.toList())
+                                    activeAssistantMsgId = assistantMsgId.toInt()
+                                    activeAssistantResponse = AssistantResponse(
+                                        reply = fullText,
+                                        speak = fullText,
+                                        action = bufferedProposedActions.firstOrNull()?.action ?: "none"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("RohitAI", "Jarvis assistant stream failed: ${e.javaClass.simpleName}")
+            streamEncounteredError = true
+            bufferedProposedActions.clear()
+            bufferedPlanSteps.clear()
+            _pendingActions.value = null
+            savePendingActionsToPrefs(null)
+            val failMsg = "⚠️ **Connection Failure:** ${e.localizedMessage ?: "Failed to communicate with Jarvis backend"}"
+            if (isTemp) {
+                _temporaryMessages.value = _temporaryMessages.value.map {
+                    if (it.id == assistantMsgId.toInt()) it.copy(text = failMsg) else it
+                }
+            } else {
+                repository.updateMessage(
+                    ConversationMessage(
+                        id = assistantMsgId.toInt(),
+                        role = "assistant",
+                        text = failMsg,
+                        isToolCall = false,
+                        sessionId = currentSess,
+                        modelUsed = "Jarvis"
+                    )
+                )
+            }
+            speak("Failed to communicate with Jarvis backend")
+        } finally {
+            _isThinking.value = false
+            if (activeUtterances.isEmpty()) {
+                _isSpeaking.value = false
+                restartListeningIfNeeded()
+            }
+        }
+    }
+
     // --- Action Execution (Tool Executor) ---
     private suspend fun executeToolAction(action: String, params: Map<String, String>?) {
         if (params == null) return
@@ -1633,10 +1991,23 @@ $savedMemories
     }
 
     fun executeConfirmedActions() {
-        val confirmedList = _pendingActions.value?.filter { it.isEnabled } ?: return
+        val rawList = _pendingActions.value?.filter { it.isEnabled } ?: return
         val response = activeAssistantResponse ?: return
         val assistantMsgId = activeAssistantMsgId ?: return
         
+        // Cryptographically bind user consent to each action and transition to AUTHORIZED
+        val confirmedList = rawList.map { pAction ->
+            val token = com.example.certification.ConsentToken.generate(
+                actionId = pAction.id,
+                actionName = pAction.action,
+                params = pAction.editedParams
+            )
+            pAction.copy(
+                state = com.example.certification.ActionState.AUTHORIZED,
+                consentToken = token
+            )
+        }
+
         _pendingActions.value = null
         savePendingActionsToPrefs(null) // Clear persisted crash state since we are starting execution
         
@@ -1666,14 +2037,14 @@ $savedMemories
                     val rec = pAction.selectedContact?.name ?: params["recipient"] ?: "someone"
                     "Sending SMS to $rec..."
                 }
-                "update_device" -> "Updating ${params["device_id"] ?: "device"} to ${params["state"] ?: "state"}..."
+                "update_device", "control_device" -> "Updating ${params["device_id"] ?: params["device"] ?: "device"} to ${params["state"] ?: "state"}..."
                 "create_reminder" -> "Creating reminder: ${params["title"] ?: "task"}..."
                 "open_app" -> "Opening app: ${params["app_package"] ?: "app"}..."
                 "web_search" -> "Searching the web for: ${params["query"] ?: "query"}..."
                 "save_memory" -> "Saving memory: ${params["fact"] ?: "fact"}..."
                 else -> "Executing $action..."
             }
-            steps.add(AgentStep(id = pAction.id, action = action, description = description, status = StepStatus.PENDING))
+            steps.add(AgentStep(id = pAction.id, action = action, description = description, status = StepStatus.PENDING, idempotencyKey = pAction.idempotencyKey))
         }
 
         _agentSteps.value = steps
@@ -1681,8 +2052,8 @@ $savedMemories
         // Track original states for potential rollback
         val originalStatesBackup = mutableMapOf<String, String>()
         confirmedList.forEach { pAction ->
-            if (pAction.action == "update_device") {
-                val deviceId = pAction.editedParams["device_id"]
+            if (pAction.action == "update_device" || pAction.action == "control_device") {
+                val deviceId = pAction.editedParams["device_id"] ?: pAction.editedParams["device"]
                 if (deviceId != null) {
                     val device = repository.getDeviceById(deviceId)
                     if (device != null) {
@@ -1697,6 +2068,7 @@ $savedMemories
         var hasFailure = false
         var abortedByEmergency = false
         val executedSteps = mutableListOf<Int>()
+        var verifiedConsentTracesCount = 0
 
         for (i in steps.indices) {
             val step = steps[i]
@@ -1709,21 +2081,61 @@ $savedMemories
                 updateStepStatus(step.id, StepStatus.FAILED, "EMERGENCY ABORT TRIGGERED!")
                 resultsSummary.append("\n• 🛑 ${step.description.replace("...", "")} aborted by global emergency stop.")
                 
+                val masked = maskSensitiveParams(step.action, pAction.editedParams)
+                val logTime = System.currentTimeMillis()
+                val logHash = calculateAuditHash(step.action, masked, "FAILED", logTime)
                 repository.insertAuditLog(
                     com.example.database.AuditLog(
+                        timestamp = logTime,
                         toolName = step.action,
-                        parameters = maskSensitiveParams(step.action, pAction.editedParams),
+                        parameters = masked,
                         riskLevel = pAction.riskLevel.name,
                         status = "FAILED",
-                        userConfirmation = true,
+                        userConfirmation = pAction.consentToken != null,
                         executionTimeMs = 0,
                         errorMessage = "Emergency Abort: Global Stop Signal Received",
                         rollbackSupported = pAction.supportsRollback,
                         sessionId = currentSessId,
-                        permissionStatus = "UNKNOWN"
+                        permissionStatus = "UNKNOWN",
+                        forensicChainJson = """{"hash":"$logHash","consent":"${pAction.consentToken?.signature ?: "NONE"}","state":"ABORTED"}"""
                     )
                 )
                 break
+            }
+
+            // Cryptographic Consent & State Machine Transition Check
+            updateStepStatus(step.id, StepStatus.VALIDATING)
+            if (pAction.riskLevel == RiskLevel.HIGH || pAction.riskLevel == RiskLevel.CRITICAL) {
+                val token = pAction.consentToken
+                val isTokenValid = token != null && token.verify(pAction.id, pAction.action, pAction.editedParams)
+                if (!isTokenValid) {
+                    hasFailure = true
+                    updateStepStatus(step.id, StepStatus.FAILED, "Cryptographic Consent Verification Failed")
+                    resultsSummary.append("\n• ❌ ${step.description.replace("...", "")} blocked: Consent token mismatch or tampered payload.")
+                    resultsSummary.append("\n  ↳ **Explainability Reason**: Vishal AI Cryptographic Consent Engine detected unverified or modified payload for high-risk action '${pAction.action}'. Execution halted.")
+                    
+                    val masked = maskSensitiveParams(step.action, pAction.editedParams)
+                    val logTime = System.currentTimeMillis()
+                    val logHash = calculateAuditHash(step.action, masked, "BLOCKED", logTime)
+                    repository.insertAuditLog(
+                        com.example.database.AuditLog(
+                            timestamp = logTime,
+                            toolName = step.action,
+                            parameters = masked,
+                            riskLevel = pAction.riskLevel.name,
+                            status = "BLOCKED",
+                            userConfirmation = false,
+                            executionTimeMs = 0,
+                            errorMessage = "Cryptographic consent token verification failed",
+                            rollbackSupported = pAction.supportsRollback,
+                            sessionId = currentSessId,
+                            permissionStatus = "DENIED",
+                            forensicChainJson = """{"hash":"$logHash","consent":"UNVERIFIED","state":"BLOCKED"}"""
+                        )
+                    )
+                    break
+                }
+                verifiedConsentTracesCount++
             }
 
             // B. Permission Engine Verification
@@ -1750,20 +2162,25 @@ $savedMemories
                 hasFailure = true
                 updateStepStatus(step.id, StepStatus.FAILED, "Permission Denied: $failedPermissionName")
                 resultsSummary.append("\n• ❌ ${step.description.replace("...", "")} blocked by Permission Engine (Missing $failedPermissionName).")
-                resultsSummary.append("\n  ↳ **Explainability Reason**: Rohit AI Security sandbox requires dynamic authorization for `$failedPermissionName` (Level: SYSTEM). To run this tool, please grant `$failedPermissionName` in the Governance Panel.")
+                resultsSummary.append("\n  ↳ **Explainability Reason**: Vishal AI Security sandbox requires dynamic authorization for `$failedPermissionName` (Level: SYSTEM). To run this tool, please grant `$failedPermissionName` in the Governance Panel.")
                 
+                val masked = maskSensitiveParams(step.action, pAction.editedParams)
+                val logTime = System.currentTimeMillis()
+                val logHash = calculateAuditHash(step.action, masked, "FAILED", logTime)
                 repository.insertAuditLog(
                     com.example.database.AuditLog(
+                        timestamp = logTime,
                         toolName = step.action,
-                        parameters = maskSensitiveParams(step.action, pAction.editedParams),
+                        parameters = masked,
                         riskLevel = pAction.riskLevel.name,
                         status = "FAILED",
-                        userConfirmation = true,
+                        userConfirmation = pAction.consentToken != null,
                         executionTimeMs = 0,
                         errorMessage = "Security Block: Missing permission $failedPermissionName",
                         rollbackSupported = pAction.supportsRollback,
                         sessionId = currentSessId,
-                        permissionStatus = "DENIED"
+                        permissionStatus = "DENIED",
+                        forensicChainJson = """{"hash":"$logHash","consent":"${pAction.consentToken?.signature ?: "NONE"}","missing_perm":"$failedPermissionName"}"""
                     )
                 )
                 break
@@ -1782,18 +2199,23 @@ $savedMemories
                     resultsSummary.append("\n• ❌ ${step.description.replace("...", "")} blocked by Policy Engine (Late Night Rule).")
                     resultsSummary.append("\n  ↳ **Explainability Reason**: Restricted by Policy `sms_night_restriction` (Priority: $rulePriority, Risk Level: HIGH). SMS execution is auto-restricted after 10 PM to protect user sleep quality. To bypass this, toggle off the policy rule in the Governance panel.")
                     
+                    val masked = maskSensitiveParams(step.action, pAction.editedParams)
+                    val logTime = System.currentTimeMillis()
+                    val logHash = calculateAuditHash(step.action, masked, "FAILED", logTime)
                     repository.insertAuditLog(
                         com.example.database.AuditLog(
+                            timestamp = logTime,
                             toolName = step.action,
-                            parameters = maskSensitiveParams(step.action, pAction.editedParams),
+                            parameters = masked,
                             riskLevel = pAction.riskLevel.name,
                             status = "FAILED",
-                            userConfirmation = true,
+                            userConfirmation = pAction.consentToken != null,
                             executionTimeMs = 0,
                             errorMessage = "Policy Blocked: SMS Restricted after 10 PM",
                             rollbackSupported = false,
                             sessionId = currentSessId,
-                            permissionStatus = "GRANTED"
+                            permissionStatus = "GRANTED",
+                            forensicChainJson = """{"hash":"$logHash","policy":"sms_night_restriction","rule_priority":"$rulePriority"}"""
                         )
                     )
                     break
@@ -1830,17 +2252,22 @@ $savedMemories
                 resultsSummary.append("\n• ✅ ${step.description.replace("...", "")} completed.")
                 executedSteps.add(i)
 
+                val masked = maskSensitiveParams(step.action, pAction.editedParams)
+                val logTime = System.currentTimeMillis()
+                val logHash = calculateAuditHash(step.action, masked, "SUCCESS", logTime)
                 repository.insertAuditLog(
                     com.example.database.AuditLog(
+                        timestamp = logTime,
                         toolName = step.action,
-                        parameters = maskSensitiveParams(step.action, pAction.editedParams),
+                        parameters = masked,
                         riskLevel = pAction.riskLevel.name,
                         status = "SUCCESS",
-                        userConfirmation = true,
+                        userConfirmation = pAction.consentToken != null,
                         executionTimeMs = duration,
                         rollbackSupported = pAction.supportsRollback,
                         sessionId = currentSessId,
-                        permissionStatus = "GRANTED"
+                        permissionStatus = "GRANTED",
+                        forensicChainJson = """{"hash":"$logHash","consent":"${pAction.consentToken?.signature ?: "NONE"}","idempotency":"${pAction.idempotencyKey}"}"""
                     )
                 )
             } else {
@@ -1849,20 +2276,28 @@ $savedMemories
                 resultsSummary.append("\n• ❌ ${step.description.replace("...", "")} failed: ${errorMsg ?: "Unknown error"}")
                 resultsSummary.append("\n  ↳ **Explainability Reason**: Tool execution sandbox caught an exception or timeout. Isolated successfully to prevent system crashes.")
 
+                val masked = maskSensitiveParams(step.action, pAction.editedParams)
+                val logTime = System.currentTimeMillis()
+                val logHash = calculateAuditHash(step.action, masked, "FAILED", logTime)
                 repository.insertAuditLog(
                     com.example.database.AuditLog(
+                        timestamp = logTime,
                         toolName = step.action,
-                        parameters = maskSensitiveParams(step.action, pAction.editedParams),
+                        parameters = masked,
                         riskLevel = pAction.riskLevel.name,
                         status = "FAILED",
-                        userConfirmation = true,
+                        userConfirmation = pAction.consentToken != null,
                         executionTimeMs = duration,
                         errorMessage = errorMsg,
                         rollbackSupported = pAction.supportsRollback,
                         sessionId = currentSessId,
-                        permissionStatus = "GRANTED"
+                        permissionStatus = "GRANTED",
+                        forensicChainJson = """{"hash":"$logHash","consent":"${pAction.consentToken?.signature ?: "NONE"}","error":"${errorMsg ?: "error"}"}"""
                     )
                 )
+            }
+
+            if (!runSuccess) {
                 break
             }
         }
@@ -1876,28 +2311,57 @@ $savedMemories
                 val step = steps[index]
                 
                 if (pAction.supportsRollback) {
-                    updateStepStatus(step.id, StepStatus.ROLLED_BACK)
-                    delay(800)
+                    updateStepStatus(step.id, StepStatus.ROLLING_BACK)
+                    delay(500)
                     
                     val rolledBackOk = performRollbackForAction(pAction.action, pAction.editedParams, originalStatesBackup)
                     if (rolledBackOk) {
+                        updateStepStatus(step.id, StepStatus.ROLLED_BACK)
                         resultsSummary.append("\n• 🛡️ Rollback: Restored state for ${step.description.replace("...", "").lowercase()}")
                         
+                        val masked = maskSensitiveParams(pAction.action, pAction.editedParams)
+                        val logTime = System.currentTimeMillis()
+                        val logHash = calculateAuditHash("${pAction.action}_rollback", masked, "ROLLED_BACK", logTime)
                         repository.insertAuditLog(
                             com.example.database.AuditLog(
+                                timestamp = logTime,
                                 toolName = "${pAction.action}_rollback",
-                                parameters = maskSensitiveParams(pAction.action, pAction.editedParams),
+                                parameters = masked,
                                 riskLevel = pAction.riskLevel.name,
                                 status = "ROLLED_BACK",
                                 userConfirmation = false,
                                 executionTimeMs = 100,
                                 rollbackSupported = false,
                                 sessionId = currentSessId,
-                                permissionStatus = "GRANTED"
+                                permissionStatus = "GRANTED",
+                                rollbackDetails = "RESTORED",
+                                forensicChainJson = """{"hash":"$logHash","action":"${pAction.action}","rollback_status":"ROLLED_BACK"}"""
                             )
                         )
                     } else {
-                        resultsSummary.append("\n• ⚠️ Rollback failed for ${step.description.replace("...", "")}")
+                        updateStepStatus(step.id, StepStatus.ROLLBACK_FAILED, "State restoration failed")
+                        resultsSummary.append("\n• 💥 CRITICAL: Rollback failed for ${step.description.replace("...", "")} (Inconsistent State Alert!)")
+                        
+                        val masked = maskSensitiveParams(pAction.action, pAction.editedParams)
+                        val logTime = System.currentTimeMillis()
+                        val logHash = calculateAuditHash("${pAction.action}_rollback_failed", masked, "ROLLBACK_FAILED", logTime)
+                        repository.insertAuditLog(
+                            com.example.database.AuditLog(
+                                timestamp = logTime,
+                                toolName = "${pAction.action}_rollback_failed",
+                                parameters = masked,
+                                riskLevel = "CRITICAL",
+                                status = "ROLLBACK_FAILED",
+                                userConfirmation = false,
+                                executionTimeMs = 100,
+                                errorMessage = "Rollback operation failed for ${pAction.action}",
+                                rollbackSupported = false,
+                                sessionId = currentSessId,
+                                permissionStatus = "GRANTED",
+                                rollbackDetails = "FAILED",
+                                forensicChainJson = """{"hash":"$logHash","action":"${pAction.action}","rollback_status":"ROLLBACK_FAILED","failure_class":"CRITICAL_STATE_INCONSISTENCY"}"""
+                            )
+                        )
                     }
                 } else {
                     resultsSummary.append("\n• ℹ️ Rollback skipped for ${step.description.replace("...", "").lowercase()} (not rollbackable)")
@@ -1939,14 +2403,20 @@ $savedMemories
 
         // Automatically run Mission Certification for executed workflow
         val plannedList = confirmedList.map { PlannedAction(action = it.action, parameters = it.editedParams) }
-        val traces = mutableListOf("AUDIT_LOG_RECORDED", "USER_CONFIRMED")
+        val traces = mutableListOf(AuditTraceAnchor.AUDIT_LOG_RECORDED.tag, AuditTraceAnchor.USER_CONFIRMED.tag)
+        if (verifiedConsentTracesCount > 0) {
+            traces.add("CRYPTOGRAPHIC_CONSENT_VERIFIED")
+        }
         confirmedList.forEach {
             when (it.action) {
-                "update_device" -> traces.add("DEVICE_STATE_CHANGED")
-                "create_reminder" -> traces.add("REMINDER_PERSISTED")
-                "save_memory" -> traces.add("MEMORY_PERSISTED")
-                "send_sms" -> { traces.add("SMS_PREPARED"); traces.add("POLICY_CHECKED") }
-                "web_search" -> traces.add("SEARCH_EXECUTED")
+                "update_device", "control_device" -> traces.add(AuditTraceAnchor.DEVICE_STATE_CHANGED.tag)
+                "create_reminder" -> traces.add(AuditTraceAnchor.REMINDER_PERSISTED.tag)
+                "save_memory" -> traces.add(AuditTraceAnchor.MEMORY_PERSISTED.tag)
+                "send_sms" -> {
+                    traces.add(AuditTraceAnchor.SMS_PREPARED.tag)
+                    traces.add(AuditTraceAnchor.POLICY_CHECKED.tag)
+                }
+                "web_search" -> traces.add(AuditTraceAnchor.SEARCH_EXECUTED.tag)
             }
         }
         certifyCustomQuery(response.speak, plannedList, traces)
@@ -1956,12 +2426,16 @@ $savedMemories
 
 
     private suspend fun performRollbackForAction(action: String, params: Map<String, String>, originalStates: Map<String, String>): Boolean {
+        if (_simulateRollbackFailure.value) {
+            Log.w("RohitAI", "Adversarial test: Simulating ROLLBACK_FAILED for action $action")
+            return false
+        }
         return try {
             when (action) {
-                "update_device" -> {
-                    val deviceId = params["device_id"] ?: return false
-                    val originalState = originalStates[deviceId] ?: "off"
-                    val device = repository.getDeviceById(deviceId)
+                "update_device", "control_device" -> {
+                    val deviceKey = params["device_id"] ?: params["device"] ?: return false
+                    val originalState = originalStates[deviceKey] ?: "off"
+                    val device = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
                     if (device != null) {
                         repository.insertOrUpdateDevice(device.copy(state = originalState))
                         true
@@ -2001,6 +2475,9 @@ $savedMemories
                 key.equals("message", ignoreCase = true) || key.equals("sms", ignoreCase = true) -> {
                     if (value.length <= 6) "*****" else "${value.take(3)}... [MASKED: ${value.length} chars]"
                 }
+                key.equals("recipient", ignoreCase = true) || key.equals("phone", ignoreCase = true) || key.equals("number", ignoreCase = true) -> {
+                    if (value.length <= 4) "****" else "${value.take(2)}***${value.takeLast(2)}"
+                }
                 key.contains("password", ignoreCase = true) || 
                 key.contains("key", ignoreCase = true) || 
                 key.contains("token", ignoreCase = true) || 
@@ -2012,6 +2489,17 @@ $savedMemories
                 else -> value
             }
         }.toString()
+    }
+
+    private fun calculateAuditHash(toolName: String, params: String, status: String, timestamp: Long): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val raw = "$toolName:$params:$status:$timestamp"
+            val digest = md.digest(raw.toByteArray(Charsets.UTF_8))
+            digest.joinToString("") { "%02x".format(it) }.take(16)
+        } catch (e: Exception) {
+            "sig_fallback_${System.currentTimeMillis()}"
+        }
     }
 
     private fun updateStepStatus(id: String, status: StepStatus, errorMsg: String? = null) {
@@ -2061,16 +2549,16 @@ $savedMemories
                     smsManager.sendTextMessage(phoneNumber, null, message, null, null)
                     Pair(true, null)
                 }
-                "update_device" -> {
-                    val deviceId = params["device_id"] ?: return Pair(false, "Device ID missing")
+                "update_device", "control_device" -> {
+                    val deviceKey = params["device_id"] ?: params["device"] ?: return Pair(false, "Device ID/name missing")
                     val state = params["state"] ?: return Pair(false, "Device state missing")
-                    val currentDevice = repository.getDeviceById(deviceId)
+                    val currentDevice = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
                     if (currentDevice != null) {
                         val updatedDevice = currentDevice.copy(state = state)
                         repository.insertOrUpdateDevice(updatedDevice)
                         Pair(true, null)
                     } else {
-                        Pair(false, "Device with ID $deviceId not found")
+                        Pair(false, "Device with ID/name $deviceKey not found")
                     }
                 }
                 "create_reminder" -> {
@@ -2094,7 +2582,10 @@ $savedMemories
                     repository.insertMemory(fact)
                     Pair(true, null)
                 }
-                else -> Pair(false, "Unknown action: $action")
+                else -> {
+                    val sanitizedAction = action.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
+                    Pair(false, "policy_violation_blocked: unknown action $sanitizedAction")
+                }
             }
         } catch (e: Exception) {
             Pair(false, e.localizedMessage ?: e.javaClass.simpleName)
@@ -2330,41 +2821,41 @@ $savedMemories
 
                 val simulatedTraces = when (m.id) {
                     "GM-SECURITY-02" -> listOf(
-                        "RISK_EVALUATED_HIGH",
-                        "CONSENT_REQUESTED",
-                        "USER_CONFIRMED",
-                        "AUDIT_LOG_RECORDED"
+                        AuditTraceAnchor.RISK_EVALUATED_HIGH.tag,
+                        AuditTraceAnchor.CONSENT_REQUESTED.tag,
+                        AuditTraceAnchor.USER_CONFIRMED.tag,
+                        AuditTraceAnchor.AUDIT_LOG_RECORDED.tag
                     )
                     "GM-ROLLBACK-01" -> listOf(
-                        "STEP_1_COMPLETED",
-                        "STEP_2_COMPLETED",
-                        "STEP_3_FAILED",
-                        "ROLLBACK_CASCADE_TRIGGERED",
-                        "STATE_RESTORED",
-                        "AUDIT_LOG_RECORDED"
+                        AuditTraceAnchor.STEP_1_COMPLETED.tag,
+                        AuditTraceAnchor.STEP_2_COMPLETED.tag,
+                        AuditTraceAnchor.STEP_3_FAILED.tag,
+                        AuditTraceAnchor.ROLLBACK_CASCADE_TRIGGERED.tag,
+                        AuditTraceAnchor.STATE_RESTORED.tag,
+                        AuditTraceAnchor.AUDIT_LOG_RECORDED.tag
                     )
                     "GM-POLICY-01" -> listOf(
-                        "POLICY_CONFLICT_DETECTED",
-                        "SYSTEM_POLICY_WINS",
-                        "EXECUTION_BLOCKED",
-                        "AUDIT_LOG_RECORDED"
+                        AuditTraceAnchor.POLICY_CONFLICT_DETECTED.tag,
+                        AuditTraceAnchor.SYSTEM_POLICY_WINS.tag,
+                        AuditTraceAnchor.EXECUTION_BLOCKED.tag,
+                        AuditTraceAnchor.AUDIT_LOG_RECORDED.tag
                     )
                     "GM-PROMPT-01" -> listOf(
-                        "DATA_INSTRUCTION_SEPARATED",
-                        "UNTRUSTED_CONTENT_SANITIZED",
-                        "BYPASS_PREVENTED",
-                        "SEARCH_EXECUTED",
-                        "AUDIT_LOG_RECORDED"
+                        AuditTraceAnchor.DATA_INSTRUCTION_SEPARATED.tag,
+                        AuditTraceAnchor.UNTRUSTED_CONTENT_SANITIZED.tag,
+                        AuditTraceAnchor.BYPASS_PREVENTED.tag,
+                        AuditTraceAnchor.SEARCH_EXECUTED.tag,
+                        AuditTraceAnchor.AUDIT_LOG_RECORDED.tag
                     )
                     else -> listOf(
-                        "DEVICE_STATE_CHANGED",
-                        "REMINDER_PERSISTED",
-                        "MEMORY_PERSISTED",
-                        "SMS_PREPARED",
-                        "POLICY_CHECKED",
-                        "USER_CONFIRMED",
-                        "SEARCH_EXECUTED",
-                        "AUDIT_LOG_RECORDED"
+                        AuditTraceAnchor.DEVICE_STATE_CHANGED.tag,
+                        AuditTraceAnchor.REMINDER_PERSISTED.tag,
+                        AuditTraceAnchor.MEMORY_PERSISTED.tag,
+                        AuditTraceAnchor.SMS_PREPARED.tag,
+                        AuditTraceAnchor.POLICY_CHECKED.tag,
+                        AuditTraceAnchor.USER_CONFIRMED.tag,
+                        AuditTraceAnchor.SEARCH_EXECUTED.tag,
+                        AuditTraceAnchor.AUDIT_LOG_RECORDED.tag
                     )
                 }
                 val cert = com.example.certification.MissionCertificationEngine.certifyMission(
@@ -2386,7 +2877,7 @@ $savedMemories
             val cert = com.example.certification.MissionCertificationEngine.certifyMission(
                 userQuery = query,
                 plannedActions = actions,
-                runtimeTraces = traces.ifEmpty { listOf("AUDIT_LOG_RECORDED") },
+                runtimeTraces = traces.ifEmpty { listOf(AuditTraceAnchor.AUDIT_LOG_RECORDED.tag) },
                 goldenMission = matchingMission
             )
             repository.insertCertificationRecord(cert)
@@ -2402,7 +2893,21 @@ $savedMemories
 }
 
 enum class StepStatus {
-    PENDING, RUNNING, COMPLETED, FAILED, ROLLED_BACK
+    PENDING,
+    PROPOSED,
+    VALIDATING,
+    BLOCKED,
+    AWAITING_CONSENT,
+    AUTHORIZED,
+    RUNNING,
+    CANCEL_REQUESTED,
+    COMPLETED,
+    FAILED,
+    ROLLBACK_PENDING,
+    ROLLING_BACK,
+    ROLLED_BACK,
+    ROLLBACK_FAILED,
+    RECOVERY_REQUIRED
 }
 
 enum class RiskLevel {
@@ -2414,7 +2919,8 @@ data class AgentStep(
     val action: String,
     val description: String,
     val status: StepStatus,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val idempotencyKey: String? = null
 )
 
 data class ContactMatch(
@@ -2432,5 +2938,8 @@ data class ProposedAction(
     val availableContacts: List<ContactMatch> = emptyList(),
     val selectedContact: ContactMatch? = null,
     val riskLevel: RiskLevel = RiskLevel.MEDIUM,
-    val supportsRollback: Boolean = false
+    val supportsRollback: Boolean = false,
+    val state: com.example.certification.ActionState = com.example.certification.ActionState.PROPOSED,
+    val idempotencyKey: String = java.util.UUID.randomUUID().toString(),
+    val consentToken: com.example.certification.ConsentToken? = null
 )

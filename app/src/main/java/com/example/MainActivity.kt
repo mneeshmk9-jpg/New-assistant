@@ -68,6 +68,7 @@ import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
+import com.example.certification.AuditTraceAnchor
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.TaskAlt
 import androidx.compose.material.icons.filled.VolumeUp
@@ -642,7 +643,7 @@ fun RohitAssistantApp(viewModel: AssistantViewModel = viewModel()) {
                                     }
                                 }
                                 .padding(horizontal = 12.dp, vertical = 8.dp)
-                                .testTag("rohit_wake_word_toggle"),
+                                .testTag("vani_wake_word_toggle"),
                             contentAlignment = Alignment.Center
                         ) {
                             Row(
@@ -669,7 +670,7 @@ fun RohitAssistantApp(viewModel: AssistantViewModel = viewModel()) {
                                         )
                                 )
                                 Text(
-                                    text = if (isWakeWordActive) "रोहित Listening" else "Wake Word: Rohit",
+                                    text = if (isWakeWordActive) "हे वाणी Listening" else "Wake Word: Hey Vani",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = if (isWakeWordActive) Color(0xFF80DEEA) else Color(0xFFCCC2DC)
@@ -956,7 +957,11 @@ fun RohitAssistantApp(viewModel: AssistantViewModel = viewModel()) {
         selectedVoice = selectedVoice,
         onClose = { viewModel.closeVoiceMode() },
         onToggleMute = {
-            if (isListening) {
+            if (isSpeaking) {
+                // Orb-tap Barge-In: Halt TTS immediately and open microphone
+                viewModel.stopSpeaking()
+                viewModel.startListening()
+            } else if (isListening) {
                 viewModel.stopListening()
             } else {
                 viewModel.startListening()
@@ -975,13 +980,18 @@ fun RohitAssistantApp(viewModel: AssistantViewModel = viewModel()) {
         onClose = { showCustomInstructionsDialog = false }
     )
 
-    // ChatGPT Settings Dialog (Voice, Persona, Clear history)
+    val hasJarvisToken by viewModel.hasJarvisToken.collectAsState()
+
+    // ChatGPT Settings Dialog (Voice, Persona, Clear history, Jarvis Token)
     ChatGptSettingsDialog(
         isOpen = showChatGptSettingsDialog,
         selectedVoice = selectedVoice,
         selectedPersona = currentPersona,
+        hasJarvisToken = hasJarvisToken,
         onVoiceChanged = { viewModel.selectVoice(it) },
         onPersonaChanged = { viewModel.selectPersona(it) },
+        onSaveJarvisToken = { token, cb -> viewModel.saveJarvisToken(token, cb) },
+        onClearJarvisToken = { viewModel.clearJarvisToken() },
         onClearAllChats = { viewModel.clearAllChats() },
         onClose = { showChatGptSettingsDialog = false }
     )
@@ -1777,10 +1787,16 @@ fun AgentWorkflowPanel(steps: List<AgentStep>) {
                             .background(
                                 when (step.status) {
                                     StepStatus.RUNNING -> Color(0x2280DEEA)
+                                    StepStatus.VALIDATING -> Color(0x2281D4FA)
+                                    StepStatus.AUTHORIZED -> Color(0x22A5D6A7)
                                     StepStatus.COMPLETED -> Color(0x1181C784)
                                     StepStatus.FAILED -> Color(0x22E57373)
                                     StepStatus.PENDING -> Color(0x08FFFFFF)
                                     StepStatus.ROLLED_BACK -> Color(0x22FFB74D)
+                                    StepStatus.ROLLING_BACK -> Color(0x22FFD54F)
+                                    StepStatus.ROLLBACK_FAILED -> Color(0x33FF1744)
+                                    StepStatus.RECOVERY_REQUIRED -> Color(0x33FF9100)
+                                    else -> Color(0x08FFFFFF)
                                 }
                             )
                             .padding(10.dp),
@@ -1796,10 +1812,16 @@ fun AgentWorkflowPanel(steps: List<AgentStep>) {
                                 contentDescription = null,
                                 tint = when (step.status) {
                                     StepStatus.RUNNING -> Color(0xFF80DEEA)
+                                    StepStatus.VALIDATING -> Color(0xFF81D4FA)
+                                    StepStatus.AUTHORIZED -> Color(0xFFA5D6A7)
                                     StepStatus.COMPLETED -> Color(0xFF81C784)
                                     StepStatus.FAILED -> Color(0xFFE57373)
                                     StepStatus.PENDING -> Color(0xFFCCC2DC)
                                     StepStatus.ROLLED_BACK -> Color(0xFFFFB74D)
+                                    StepStatus.ROLLING_BACK -> Color(0xFFFFD54F)
+                                    StepStatus.ROLLBACK_FAILED -> Color(0xFFFF1744)
+                                    StepStatus.RECOVERY_REQUIRED -> Color(0xFFFF9100)
+                                    else -> Color.White
                                 },
                                 modifier = Modifier.size(18.dp)
                             )
@@ -1829,6 +1851,12 @@ fun AgentWorkflowPanel(steps: List<AgentStep>) {
                         when (step.status) {
                             StepStatus.PENDING -> {
                                 Text(text = "WAITING", color = Color(0x44FFFFFF), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                            StepStatus.VALIDATING -> {
+                                Text(text = "VALIDATING", color = Color(0xFF81D4FA), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                            StepStatus.AUTHORIZED -> {
+                                Text(text = "AUTHORIZED", color = Color(0xFFA5D6A7), fontSize = 9.sp, fontWeight = FontWeight.Bold)
                             }
                             StepStatus.RUNNING -> {
                                 CircularProgressIndicator(
@@ -1860,6 +1888,32 @@ fun AgentWorkflowPanel(steps: List<AgentStep>) {
                                     tint = Color(0xFFFFB74D),
                                     modifier = Modifier.size(16.dp)
                                 )
+                            }
+                            StepStatus.ROLLING_BACK -> {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(14.dp),
+                                    strokeWidth = 2.dp,
+                                    color = Color(0xFFFFD54F)
+                                )
+                            }
+                            StepStatus.ROLLBACK_FAILED -> {
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = "Rollback Failed",
+                                    tint = Color(0xFFFF1744),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            StepStatus.RECOVERY_REQUIRED -> {
+                                Icon(
+                                    imageVector = Icons.Default.History,
+                                    contentDescription = "Recovery Required",
+                                    tint = Color(0xFFFF9100),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            else -> {
+                                Text(text = step.status.name, color = Color.White, fontSize = 9.sp)
                             }
                         }
                     }
@@ -2232,6 +2286,7 @@ fun GovernanceTab(
     val activeSessionId by viewModel.activeSessionId.collectAsState()
     val permissionsState by viewModel.permissionsState.collectAsState()
     val toolReputations by viewModel.toolReputations.collectAsState()
+    val simulateRollbackFailure by viewModel.simulateRollbackFailure.collectAsState()
 
     LazyColumn(
         modifier = modifier
@@ -2706,6 +2761,61 @@ fun GovernanceTab(
                 }
             }
         }
+
+        // 6b. Adversarial Governance & Resilience Testing Controls
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0x15FF1744)),
+                border = BorderStroke(1.dp, Color(0xFFFF1744).copy(alpha = 0.3f))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "⚔️ ADVERSARIAL VERIFICATION & RESILIENCE",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFFF8A80),
+                        letterSpacing = 1.sp
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Governance chain integrity verification and failure class simulation.",
+                        color = Color.LightGray,
+                        fontSize = 11.sp
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Simulate Rollback Failure",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Forces state restoration failure to trigger ROLLBACK_FAILED",
+                                color = Color.White.copy(alpha = 0.6f),
+                                fontSize = 11.sp
+                            )
+                        }
+                        Switch(
+                            checked = simulateRollbackFailure,
+                            onCheckedChange = { viewModel.setSimulateRollbackFailure(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFFFF1744),
+                                checkedTrackColor = Color(0xFF5C0011)
+                            )
+                        )
+                    }
+                }
+            }
+        }
  
         // 7. Detailed Audit Trail Logs
         item {
@@ -2822,12 +2932,18 @@ fun AuditLogItemView(log: com.example.database.AuditLog) {
                     "SUCCESS" -> Color(0xFF81C784)
                     "FAILED" -> Color(0xFFE57373)
                     "ROLLED_BACK" -> Color(0xFFFFB74D)
+                    "ROLLING_BACK" -> Color(0xFFFFD54F)
+                    "ROLLBACK_FAILED" -> Color(0xFFFF1744)
+                    "RECOVERY_REQUIRED" -> Color(0xFFFF9100)
                     else -> Color.White
                 }
                 val statusText = when (log.status) {
                     "SUCCESS" -> "✅ SUCCESS"
                     "FAILED" -> "❌ FAILED"
                     "ROLLED_BACK" -> "🛡️ ROLLED BACK"
+                    "ROLLING_BACK" -> "⏳ ROLLING BACK"
+                    "ROLLBACK_FAILED" -> "💥 ROLLBACK FAILED"
+                    "RECOVERY_REQUIRED" -> "⚠️ RECOVERY REQ"
                     else -> log.status
                 }
                 Text(
@@ -2938,7 +3054,7 @@ fun AuditLogItemView(log: com.example.database.AuditLog) {
                     Triple("6. RISK LEVEL", log.riskLevel, when (log.riskLevel) { "HIGH", "CRITICAL" -> Color(0xFFE57373); "MEDIUM" -> Color(0xFFFFB74D); else -> Color(0xFF81C784) }),
                     Triple("7. CAPABILITY CHECK", log.capabilityCheck ?: "DEVICE_ONLINE", Color(0xFF81C784)),
                     Triple("8. PERMISSION CHECK", log.permissionStatus ?: "GRANTED", if (log.permissionStatus == "DENIED") Color(0xFFE57373) else Color(0xFF81C784)),
-                    Triple("9. USER CONSENT", if (log.userConfirmation) "USER_CONFIRMED" else "NOT_REQUIRED", Color(0xFF80DEEA)),
+                    Triple("9. USER CONSENT", if (log.userConfirmation) AuditTraceAnchor.USER_CONFIRMED.tag else "NOT_REQUIRED", Color(0xFF80DEEA)),
                     Triple("10. EXECUTION", "${log.status} (${log.executionTimeMs} ms)", if (log.status == "SUCCESS") Color(0xFF81C784) else Color(0xFFE57373)),
                     Triple("11. ROLLBACK", rollbackStateInfo.first, rollbackStateInfo.second)
                 )

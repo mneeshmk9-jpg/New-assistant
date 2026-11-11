@@ -3,6 +3,7 @@ package com.example.ui.components
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -144,11 +145,12 @@ fun ChatGptVoiceModeDialog(
                             )
                         }
 
-                        // Core dynamic sphere
+                        // Core dynamic sphere (Tap to Barge-In / Interrupt or Mute)
                         Box(
                             modifier = Modifier
                                 .size(140.dp * if (isSpeaking || isListening) pulseScale else 0.98f)
                                 .clip(CircleShape)
+                                .clickable { onToggleMute() }
                                 .background(
                                     Brush.linearGradient(
                                         colors = if (isSpeaking) {
