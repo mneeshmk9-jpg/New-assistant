@@ -6,8 +6,10 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="datastore/jarvis_secure.preferences_pb"/>
+        <exclude domain="sharedpref" path="rohit_recovery.xml"/>
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="datastore/jarvis_secure.preferences_pb"/>
+        <exclude domain="sharedpref" path="rohit_recovery.xml"/>
     </device-transfer>
 </data-extraction-rules>

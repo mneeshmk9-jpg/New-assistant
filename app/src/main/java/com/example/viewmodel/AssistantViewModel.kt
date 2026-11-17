@@ -3,7 +3,12 @@ package com.example.viewmodel
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -16,7 +21,10 @@ import com.example.BuildConfig
 import android.Manifest
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
+import android.provider.AlarmClock
 import android.provider.ContactsContract
+import android.provider.MediaStore
+import android.provider.Settings
 import android.telephony.SmsManager
 import com.example.database.AssistantRepository
 import com.example.database.AppDatabase
@@ -65,6 +73,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val activeUtterances = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     @Volatile
     private var streamFinished = false
+    private val localIntentRouter = com.example.jarvis.LocalIntentRouter()
+    @Volatile
+    private var isTorchCurrentlyOn = false
+    private var torchCallback: CameraManager.TorchCallback? = null
 
     // UI States
     private val _isListening = MutableStateFlow(false)
@@ -110,8 +122,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     companion object {
         val ALLOWED_PLAN_ACTIONS = setOf(
-            "send_sms", "update_device", "control_device", "create_reminder", "open_app", "web_search", "save_memory"
+            "send_sms", "update_device", "create_reminder", "open_app", "save_memory"
         )
+
+        fun validatePlanActions(actions: List<ProposedAction>?): Pair<Boolean, String?> {
+            if (actions.isNullOrEmpty()) return Pair(true, null)
+            val disallowed = actions.find { it.action !in ALLOWED_PLAN_ACTIONS }
+            return if (disallowed != null) {
+                val sanitized = disallowed.action.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
+                Pair(false, sanitized)
+            } else {
+                Pair(true, null)
+            }
+        }
     }
 
     val tokenManager by lazy { com.example.jarvis.SecureTokenManager(getApplication()) }
@@ -139,14 +162,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun validateProposedPlan(actions: List<ProposedAction>?): Pair<Boolean, String?> {
-        if (actions.isNullOrEmpty()) return Pair(true, null)
-        val disallowed = actions.find { it.action !in ALLOWED_PLAN_ACTIONS }
-        return if (disallowed != null) {
-            val sanitized = disallowed.action.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
-            Pair(false, sanitized)
-        } else {
-            Pair(true, null)
-        }
+        return validatePlanActions(actions)
     }
 
     fun recordBlockedPlanAudit(blockedTool: String, sessionId: String = _currentSessionId.value) {
@@ -537,38 +553,56 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun savePendingActionsToPrefs(actions: List<ProposedAction>?) {
-        val prefs = getApplication<Application>().getSharedPreferences("rohit_recovery", Context.MODE_PRIVATE)
+        val appContext = getApplication<Application>()
         if (actions == null || actions.isEmpty()) {
-            prefs.edit().remove("pending_actions").apply()
+            com.example.jarvis.SecureRecoveryStorage.clear(appContext)
         } else {
             try {
                 val type = Types.newParameterizedType(List::class.java, ProposedAction::class.java)
                 val adapter = moshi.adapter<List<ProposedAction>>(type)
                 val json = adapter.toJson(actions)
-                prefs.edit().putString("pending_actions", json).apply()
-                Log.d("RohitAI", "Saved pending actions for crash recovery: $json")
+                val saved = com.example.jarvis.SecureRecoveryStorage.saveEncryptedJson(appContext, json)
+                if (saved) {
+                    Log.d("RohitAI", "Saved ${actions.size} pending action(s) for crash recovery (Keystore encrypted)")
+                }
             } catch (e: Exception) {
-                Log.e("RohitAI", "Failed to save pending actions", e)
+                Log.e("RohitAI", "Failed to save pending actions: ${e.javaClass.simpleName}")
+                com.example.jarvis.SecureRecoveryStorage.clear(appContext)
             }
         }
     }
 
     fun checkForInterruptedSession() {
-        val prefs = getApplication<Application>().getSharedPreferences("rohit_recovery", Context.MODE_PRIVATE)
-        val json = prefs.getString("pending_actions", null)
+        val appContext = getApplication<Application>()
+        val json = com.example.jarvis.SecureRecoveryStorage.loadDecryptedJson(appContext)
         if (!json.isNullOrEmpty()) {
             try {
                 val type = Types.newParameterizedType(List::class.java, ProposedAction::class.java)
                 val adapter = moshi.adapter<List<ProposedAction>>(type)
                 val actions = adapter.fromJson(json)
                 if (!actions.isNullOrEmpty()) {
-                    recoveredActions = actions.map { it.copy(state = com.example.certification.ActionState.RECOVERY_REQUIRED) }
+                    val (isValid, blockedTool) = validateProposedPlan(actions)
+                    if (!isValid) {
+                        val tool = (blockedTool ?: "recovered_tampered_action").replace(Regex("[^a-zA-Z0-9_]"), "").take(40)
+                        Log.w("RohitAI", "Interrupted session rejected by Pre-Consent Gate on load: $tool")
+                        recordBlockedPlanAudit(tool)
+                        com.example.jarvis.SecureRecoveryStorage.clear(appContext)
+                        recoveredActions = null
+                        _hasRecoveryPending.value = false
+                        return
+                    }
+                    recoveredActions = actions.map {
+                        it.copy(
+                            state = com.example.certification.ActionState.RECOVERY_REQUIRED,
+                            consentToken = null
+                        )
+                    }
                     _hasRecoveryPending.value = true
                     _agentSteps.value = recoveredActions?.map {
                         AgentStep(
                             id = it.id,
                             action = it.action,
-                            description = it.description,
+                            description = "Interrupted ${it.action} action (re-consent required)",
                             status = StepStatus.RECOVERY_REQUIRED,
                             errorMessage = "Application interrupted during execution. Recovery required."
                         )
@@ -576,34 +610,47 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     Log.d("RohitAI", "Interrupted session found for recovery with ${actions.size} actions in RECOVERY_REQUIRED state.")
                 }
             } catch (e: Exception) {
-                Log.e("RohitAI", "Failed to parse recovered actions", e)
+                Log.e("RohitAI", "Failed to parse recovered actions: ${e.javaClass.simpleName}")
+                com.example.jarvis.SecureRecoveryStorage.clear(appContext)
             }
         }
     }
 
     fun restoreCrashedSession() {
+        val appContext = getApplication<Application>()
         val actions = recoveredActions
         val (isValid, blockedTool) = validateProposedPlan(actions)
         if (actions != null && isValid) {
-            _pendingActions.value = actions
-            Log.d("RohitAI", "Restored pending actions successfully!")
+            val resetForReconsent = actions.map {
+                it.copy(
+                    state = com.example.certification.ActionState.PROPOSED,
+                    consentToken = null
+                )
+            }
+            if (activeAssistantResponse == null) {
+                activeAssistantResponse = AssistantResponse(
+                    reply = "Restored interrupted action plan. Please review and confirm.",
+                    speak = "Restored interrupted action plan. Please review and confirm.",
+                    action = resetForReconsent.firstOrNull()?.action ?: "none"
+                )
+            }
+            setPendingActions(resetForReconsent)
+            Log.d("RohitAI", "Restored ${resetForReconsent.size} pending actions to consent gate.")
         } else if (!isValid) {
-            val tool = blockedTool ?: "recovered_tampered_action"
+            val tool = (blockedTool ?: "recovered_tampered_action").replace(Regex("[^a-zA-Z0-9_]"), "").take(40)
             Log.w("RohitAI", "Recovered crashed actions rejected by Pre-Consent Gate: $tool")
             recordBlockedPlanAudit(tool)
-            _pendingActions.value = null
+            setPendingActions(null)
         }
         _hasRecoveryPending.value = false
         recoveredActions = null
-        val prefs = getApplication<Application>().getSharedPreferences("rohit_recovery", Context.MODE_PRIVATE)
-        prefs.edit().remove("pending_actions").apply()
+        com.example.jarvis.SecureRecoveryStorage.clear(appContext)
     }
 
     fun discardCrashedSession() {
         _hasRecoveryPending.value = false
         recoveredActions = null
-        val prefs = getApplication<Application>().getSharedPreferences("rohit_recovery", Context.MODE_PRIVATE)
-        prefs.edit().remove("pending_actions").apply()
+        com.example.jarvis.SecureRecoveryStorage.clear(getApplication())
         Log.d("RohitAI", "Discarded crashed session.")
     }
 
@@ -755,6 +802,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Sync system permissions and check for any interrupted crash recovery sessions on launch
         syncPermissionsWithSystem()
         checkForInterruptedSession()
+
+        // Track hardware flashlight state for accurate multi-step rollback
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val cm = application.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                val cb = object : CameraManager.TorchCallback() {
+                    override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                        isTorchCurrentlyOn = enabled
+                    }
+                }
+                cm?.registerTorchCallback(cb, null)
+                torchCallback = cb
+            } catch (e: Exception) {
+                Log.w("RohitAI", "TorchCallback registration skipped: ${e.javaClass.simpleName}")
+            }
+        }
 
         // Decoupled wake word listener from foreground service
         viewModelScope.launch {
@@ -1159,6 +1222,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
 
+            // Offline Fast-Path: Bypass network/LLM if connectivity is absent and route through Pre-Consent Gate
+            if (!isNetworkAvailable()) {
+                handleOfflineQuery(
+                    query = query,
+                    isTemp = isTemp,
+                    currentSess = currentSess,
+                    showUnsupportedNotice = true
+                )
+                return@launch
+            }
+
             // Route to Jarvis Backend if Secure Device Token is provisioned
             if (tokenManager.hasToken()) {
                 processUserQueryWithJarvis(query, isTemp, currentSess, currentMdl)
@@ -1457,9 +1531,6 @@ $savedMemories
                         }
 
                         // PRE-CONSENT PLANNING GATE: Reject any plan containing disallowed tools before consent UI
-                        val ALLOWED_PLAN_ACTIONS = setOf(
-                            "send_sms", "update_device", "control_device", "create_reminder", "open_app", "web_search", "save_memory"
-                        )
                         val disallowedAction = rawActions.find { it.first !in ALLOWED_PLAN_ACTIONS }
                         if (disallowedAction != null) {
                             val blockedTool = disallowedAction.first.take(40).replace(Regex("[^a-zA-Z0-9_]"), "")
@@ -1561,7 +1632,7 @@ $savedMemories
                                           _simulatedConfidence.value < 80
 
                         if (needsReview) {
-                            _pendingActions.value = proposed
+                            setPendingActions(proposed)
                             
                             val confidenceText = if (_simulatedConfidence.value < 80) {
                                 "\n\n⚠️ **LOW CONFIDENCE WARNING (${_simulatedConfidence.value}%):** Rohit AI detected low-confidence/ambiguous intent. Please verify the proposed steps below."
@@ -1725,10 +1796,9 @@ $savedMemories
         activeUtterances.clear()
         streamFinished = false
 
-        // Invariant: Actions and plans are BUFFERED in memory until JarvisServerEvent.Done is received.
+        // Invariant: Actions and plans are BUFFERED in memory via JarvisStreamEventBuffer until JarvisServerEvent.Done is received.
         // Zero action execution, zero consent UI, and zero state machine mutation before Done.
-        val bufferedProposedActions = mutableListOf<ProposedAction>()
-        val bufferedPlanSteps = mutableListOf<com.example.jarvis.PlannedStep>()
+        val streamBuffer = com.example.jarvis.JarvisStreamEventBuffer(ALLOWED_PLAN_ACTIONS)
         var streamEncounteredError = false
 
         try {
@@ -1749,18 +1819,19 @@ $savedMemories
                     }
                     com.example.jarvis.JarvisHistoryTurn(
                         role = normalizedRole,
-                        text = it.text.trim()
+                        text = it.text.trim().take(1500)
                     )
                 }
 
             val request = com.example.jarvis.JarvisAssistantRequest(
-                text = query.trim(),
+                text = query.trim().take(4000),
                 history = conversationHistory
             )
 
             jarvisSseClient.streamAssistant(request).collect { event ->
                 when (event) {
                     is com.example.jarvis.JarvisServerEvent.TextDelta -> {
+                        streamBuffer.onTextDelta(event.delta)
                         fullTextBuilder.append(event.delta)
                         val currentText = fullTextBuilder.toString()
                         if (isTemp) {
@@ -1790,81 +1861,72 @@ $savedMemories
                     }
 
                     is com.example.jarvis.JarvisServerEvent.Plan -> {
-                        bufferedPlanSteps.clear()
-                        bufferedPlanSteps.addAll(event.steps)
+                        streamBuffer.onPlan(event)
                         Log.d("RohitAI", "Jarvis SSE Plan buffered: ${event.planId} with ${event.steps.size} steps")
                     }
 
                     is com.example.jarvis.JarvisServerEvent.Action -> {
-                        val desc = when (event.tool) {
-                            "send_sms" -> "Send SMS to ${event.args["recipient"] ?: "someone"}"
-                            "update_device", "control_device" -> "Update ${event.args["device_id"] ?: event.args["device"] ?: "device"} to ${event.args["state"] ?: "state"}"
-                            "create_reminder" -> "Create reminder: ${event.args["title"] ?: "task"}"
-                            "open_app" -> "Open app: ${event.args["app_package"] ?: "app"}"
-                            "save_memory" -> "Save memory: ${event.args["fact"] ?: "fact"}"
-                            else -> "Execute ${event.tool}"
-                        }
-                        val risk = try {
-                            RiskLevel.valueOf(event.riskLevel.uppercase())
-                        } catch (e: Exception) {
-                            RiskLevel.HIGH
-                        }
-                        bufferedProposedActions.add(
-                            ProposedAction(
-                                id = event.actionId,
-                                action = event.tool,
-                                description = desc,
-                                originalParams = event.args,
-                                editedParams = event.args,
-                                riskLevel = risk,
-                                supportsRollback = event.tool in listOf("update_device", "control_device", "save_memory")
-                            )
-                        )
+                        streamBuffer.onAction(event)
                     }
 
                     is com.example.jarvis.JarvisServerEvent.Error -> {
                         streamEncounteredError = true
-                        bufferedProposedActions.clear()
-                        bufferedPlanSteps.clear()
+                        streamBuffer.onError(event)
                         _pendingActions.value = null
                         savePendingActionsToPrefs(null)
-                        val errorText = when (event.code) {
-                            "UNAUTHORIZED" -> "⚠️ **Unauthorized (401):** Device Bearer token is invalid or missing. Please check your Jarvis token in Settings."
-                            "BAD_REQUEST" -> "⚠️ **Bad Request (400):** Invalid request parameters sent to Jarvis backend."
-                            "FORBIDDEN" -> "⚠️ **Forbidden (403):** Device token lacks required permissions."
-                            "RATE_LIMITED" -> "⚠️ **Rate Limited (429):** Too many requests to Jarvis backend. Please wait a moment."
-                            "UPSTREAM_TIMEOUT" -> "⚠️ **Upstream Timeout:** Jarvis backend timed out awaiting upstream processing."
-                            "UPSTREAM_ERROR" -> "⚠️ **Upstream Error:** Jarvis server encountered an upstream failure. ${event.message ?: ""}".trim()
-                            "SENSITIVE_UNAVAILABLE" -> "⚠️ **Sensitive Unavailable:** Request marked sensitive but upstream provider is unavailable."
-                            "CONTENT_BLOCKED" -> "⚠️ **Content Blocked:** Request or response blocked by safety filters."
-                            "INVALID_TOOL_CALL" -> "⚠️ **Invalid Tool Call:** Upstream model generated a malformed or unauthorized tool call."
-                            "INTERNAL" -> "⚠️ **Internal Error (500):** Jarvis server internal error."
-                            "NETWORK_ERROR" -> "⚠️ **Network Error:** Unable to connect to Jarvis server. Please check your network connection."
-                            "SECURITY_VIOLATION" -> "⚠️ **Security Violation:** Transport security rejected (non-HTTPS)."
-                            else -> "⚠️ **Error (${event.code}):** ${event.message ?: "An error occurred with Jarvis backend."}"
-                        }
-                        if (isTemp) {
-                            _temporaryMessages.value = _temporaryMessages.value.map {
-                                if (it.id == assistantMsgId.toInt()) it.copy(text = errorText) else it
-                            }
-                        } else {
-                            repository.updateMessage(
-                                ConversationMessage(
-                                    id = assistantMsgId.toInt(),
-                                    role = "assistant",
-                                    text = errorText,
-                                    isToolCall = false,
-                                    sessionId = currentSess,
-                                    modelUsed = "Jarvis"
-                                )
+
+                        val handledOffline = if (event.code == "NETWORK_ERROR" && fullTextBuilder.isEmpty()) {
+                            handleOfflineQuery(
+                                query = query,
+                                isTemp = isTemp,
+                                currentSess = currentSess,
+                                existingAssistantMsgId = assistantMsgId.toInt(),
+                                showUnsupportedNotice = false
                             )
+                        } else {
+                            false
                         }
-                        _errorMessage.value = errorText
-                        speak(errorText.replace(Regex("[*#_`⚠️]"), ""))
+
+                        if (!handledOffline) {
+                            val errorText = when (event.code) {
+                                "UNAUTHORIZED" -> "⚠️ **Unauthorized (401):** Device Bearer token is invalid or missing. Please check your Jarvis token in Settings."
+                                "BAD_REQUEST" -> "⚠️ **Bad Request (400):** Invalid request parameters sent to Jarvis backend."
+                                "FORBIDDEN" -> "⚠️ **Forbidden (403):** Device token lacks required permissions."
+                                "RATE_LIMITED" -> "⚠️ **Rate Limited (429):** Too many requests to Jarvis backend. Please wait a moment."
+                                "UPSTREAM_TIMEOUT" -> "⚠️ **Upstream Timeout:** Jarvis backend timed out awaiting upstream processing."
+                                "UPSTREAM_ERROR" -> "⚠️ **Upstream Error:** Jarvis server encountered an upstream failure. ${event.message ?: ""}".trim()
+                                "SENSITIVE_UNAVAILABLE" -> "⚠️ **Sensitive Unavailable:** Request marked sensitive but upstream provider is unavailable."
+                                "CONTENT_BLOCKED" -> "⚠️ **Content Blocked:** Request or response blocked by safety filters."
+                                "INVALID_TOOL_CALL" -> "⚠️ **Invalid Tool Call:** Upstream model generated a malformed or unauthorized tool call."
+                                "INTERNAL" -> "⚠️ **Internal Error (500):** Jarvis server internal error."
+                                "NETWORK_ERROR" -> "⚠️ **Network Error:** Unable to connect to Jarvis server. Please check your network connection."
+                                "SECURITY_VIOLATION" -> "⚠️ **Security Violation:** Transport security rejected (non-HTTPS)."
+                                else -> "⚠️ **Error (${event.code}):** ${event.message ?: "An error occurred with Jarvis backend."}"
+                            }
+                            if (isTemp) {
+                                _temporaryMessages.value = _temporaryMessages.value.map {
+                                    if (it.id == assistantMsgId.toInt()) it.copy(text = errorText) else it
+                                }
+                            } else {
+                                repository.updateMessage(
+                                    ConversationMessage(
+                                        id = assistantMsgId.toInt(),
+                                        role = "assistant",
+                                        text = errorText,
+                                        isToolCall = false,
+                                        sessionId = currentSess,
+                                        modelUsed = "Jarvis"
+                                    )
+                                )
+                            }
+                            _errorMessage.value = errorText
+                            speak(errorText.replace(Regex("[*#_`⚠️]"), ""))
+                        }
                     }
 
                     is com.example.jarvis.JarvisServerEvent.Done -> {
                         streamFinished = true
+                        val completedSuccessfully = streamBuffer.onDone()
                         if (!streamEncounteredError) {
                             val fullText = fullTextBuilder.toString()
                             if (fullText.length > processedSpeakLength) {
@@ -1875,40 +1937,37 @@ $savedMemories
                                 }
                             }
 
-                            if (bufferedProposedActions.isNotEmpty()) {
-                                val (isValid, blockedTool) = validateProposedPlan(bufferedProposedActions)
-                                if (!isValid) {
-                                    val tool = blockedTool ?: "unknown"
-                                    recordBlockedPlanAudit(tool, currentSess)
-                                    val rejectNotice = "⚠️ **Action Plan Rejected:** The assistant proposed an unauthorized action (`$tool`). For device security and policy integrity, this operation was blocked before asking for your consent."
-                                    if (isTemp) {
-                                        _temporaryMessages.value = _temporaryMessages.value.map {
-                                            if (it.id == assistantMsgId.toInt()) it.copy(text = fullText + "\n\n" + rejectNotice) else it
-                                        }
-                                    } else {
-                                        repository.updateMessage(
-                                            ConversationMessage(
-                                                id = assistantMsgId.toInt(),
-                                                role = "assistant",
-                                                text = fullText + "\n\n" + rejectNotice,
-                                                isToolCall = false,
-                                                sessionId = currentSess,
-                                                modelUsed = "Jarvis"
-                                            )
-                                        )
+                            if (!completedSuccessfully && streamBuffer.blockedToolDueToPolicy != null) {
+                                val tool = streamBuffer.blockedToolDueToPolicy ?: "unknown"
+                                recordBlockedPlanAudit(tool, currentSess)
+                                val rejectNotice = "⚠️ **Action Plan Rejected:** The assistant proposed an unauthorized action (`$tool`). For device security and policy integrity, this operation was blocked before asking for your consent."
+                                if (isTemp) {
+                                    _temporaryMessages.value = _temporaryMessages.value.map {
+                                        if (it.id == assistantMsgId.toInt()) it.copy(text = fullText + "\n\n" + rejectNotice) else it
                                     }
-                                    speak("Action plan was rejected due to policy restrictions on tool $tool")
-                                    bufferedProposedActions.clear()
                                 } else {
-                                    _pendingActions.value = bufferedProposedActions.toList()
-                                    savePendingActionsToPrefs(bufferedProposedActions.toList())
-                                    activeAssistantMsgId = assistantMsgId.toInt()
-                                    activeAssistantResponse = AssistantResponse(
-                                        reply = fullText,
-                                        speak = fullText,
-                                        action = bufferedProposedActions.firstOrNull()?.action ?: "none"
+                                    repository.updateMessage(
+                                        ConversationMessage(
+                                            id = assistantMsgId.toInt(),
+                                            role = "assistant",
+                                            text = fullText + "\n\n" + rejectNotice,
+                                            isToolCall = false,
+                                            sessionId = currentSess,
+                                            modelUsed = "Jarvis"
+                                        )
                                     )
                                 }
+                                speak("Action plan was rejected due to policy restrictions on tool $tool")
+                            } else if (streamBuffer.pendingActions != null) {
+                                val actions = streamBuffer.pendingActions!!
+                                _pendingActions.value = actions
+                                savePendingActionsToPrefs(actions)
+                                activeAssistantMsgId = assistantMsgId.toInt()
+                                activeAssistantResponse = AssistantResponse(
+                                    reply = fullText,
+                                    speak = fullText,
+                                    action = actions.firstOrNull()?.action ?: "none"
+                                )
                             }
                         }
                     }
@@ -1917,33 +1976,153 @@ $savedMemories
         } catch (e: Exception) {
             Log.e("RohitAI", "Jarvis assistant stream failed: ${e.javaClass.simpleName}")
             streamEncounteredError = true
-            bufferedProposedActions.clear()
-            bufferedPlanSteps.clear()
+            streamBuffer.onError(com.example.jarvis.JarvisServerEvent.Error(code = "NETWORK_ERROR", message = e.message))
             _pendingActions.value = null
             savePendingActionsToPrefs(null)
-            val failMsg = "⚠️ **Connection Failure:** ${e.localizedMessage ?: "Failed to communicate with Jarvis backend"}"
-            if (isTemp) {
-                _temporaryMessages.value = _temporaryMessages.value.map {
-                    if (it.id == assistantMsgId.toInt()) it.copy(text = failMsg) else it
-                }
-            } else {
-                repository.updateMessage(
-                    ConversationMessage(
-                        id = assistantMsgId.toInt(),
-                        role = "assistant",
-                        text = failMsg,
-                        isToolCall = false,
-                        sessionId = currentSess,
-                        modelUsed = "Jarvis"
-                    )
+
+            val handledOffline = if (fullTextBuilder.isEmpty()) {
+                handleOfflineQuery(
+                    query = query,
+                    isTemp = isTemp,
+                    currentSess = currentSess,
+                    existingAssistantMsgId = assistantMsgId.toInt(),
+                    showUnsupportedNotice = false
                 )
+            } else {
+                false
             }
-            speak("Failed to communicate with Jarvis backend")
+
+            if (!handledOffline) {
+                val failMsg = "⚠️ **Connection Failure:** ${e.localizedMessage ?: "Failed to communicate with Jarvis backend"}"
+                if (isTemp) {
+                    _temporaryMessages.value = _temporaryMessages.value.map {
+                        if (it.id == assistantMsgId.toInt()) it.copy(text = failMsg) else it
+                    }
+                } else {
+                    repository.updateMessage(
+                        ConversationMessage(
+                            id = assistantMsgId.toInt(),
+                            role = "assistant",
+                            text = failMsg,
+                            isToolCall = false,
+                            sessionId = currentSess,
+                            modelUsed = "Jarvis"
+                        )
+                    )
+                }
+                speak("Failed to communicate with Jarvis backend")
+            }
         } finally {
             _isThinking.value = false
             if (activeUtterances.isEmpty()) {
                 _isSpeaking.value = false
                 restartListeningIfNeeded()
+            }
+        }
+    }
+
+    fun isNetworkAvailable(): Boolean {
+        return try {
+            val cm = getApplication<Application>().getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val network = cm.activeNetwork ?: return false
+                val capabilities = cm.getNetworkCapabilities(network) ?: return false
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ||
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+            } else {
+                @Suppress("DEPRECATION")
+                cm.activeNetworkInfo?.isConnected == true
+            }
+        } catch (e: Exception) {
+            Log.w("RohitAI", "Network availability check failed: ${e.javaClass.simpleName}")
+            false
+        }
+    }
+
+    private suspend fun handleOfflineQuery(
+        query: String,
+        isTemp: Boolean,
+        currentSess: String,
+        existingAssistantMsgId: Int? = null,
+        showUnsupportedNotice: Boolean = true
+    ): Boolean {
+        suspend fun upsertAssistantMessage(text: String, isToolCall: Boolean): Int {
+            return if (existingAssistantMsgId != null) {
+                if (isTemp) {
+                    _temporaryMessages.value = _temporaryMessages.value.map {
+                        if (it.id == existingAssistantMsgId) {
+                            it.copy(text = text, isToolCall = isToolCall, modelUsed = "Offline Router")
+                        } else {
+                            it
+                        }
+                    }
+                } else {
+                    repository.updateMessage(
+                        ConversationMessage(
+                            id = existingAssistantMsgId,
+                            role = "assistant",
+                            text = text,
+                            isToolCall = isToolCall,
+                            sessionId = currentSess,
+                            modelUsed = "Offline Router"
+                        )
+                    )
+                }
+                existingAssistantMsgId
+            } else {
+                if (isTemp) {
+                    val tempId = (System.currentTimeMillis() + 1).toInt()
+                    _temporaryMessages.value = _temporaryMessages.value + ConversationMessage(
+                        id = tempId,
+                        role = "assistant",
+                        text = text,
+                        isToolCall = isToolCall,
+                        sessionId = "temp",
+                        modelUsed = "Offline Router"
+                    )
+                    tempId
+                } else {
+                    repository.insertMessage(
+                        ConversationMessage(
+                            role = "assistant",
+                            text = text,
+                            isToolCall = isToolCall,
+                            sessionId = currentSess,
+                            modelUsed = "Offline Router"
+                        )
+                    ).toInt()
+                }
+            }
+        }
+
+        return when (val result = localIntentRouter.parseAndRoute(query, devices.value)) {
+            is com.example.jarvis.LocalIntentResult.Success -> {
+                val msgId = upsertAssistantMessage(result.responseText, isToolCall = true)
+                activeAssistantMsgId = msgId
+                activeAssistantResponse = AssistantResponse(
+                    reply = result.responseText,
+                    speak = result.responseText,
+                    action = result.actions.firstOrNull()?.action ?: "none"
+                )
+                // Always pass through Pre-Consent Gate + Consent Card (Zero-Trust invariant)
+                setPendingActions(result.actions)
+                speak(result.responseText)
+                _isThinking.value = false
+                true
+            }
+            is com.example.jarvis.LocalIntentResult.NotHandled -> {
+                if (showUnsupportedNotice) {
+                    val offlineMsg = "⚠️ **Offline:** इंटरनेट उपलब्ध नहीं है और यह कमांड ऑफ़लाइन समर्थित नहीं है।"
+                    upsertAssistantMessage(offlineMsg, isToolCall = false)
+                    _errorMessage.value = offlineMsg
+                    speak("इंटरनेट उपलब्ध नहीं है और यह कमांड ऑफ़लाइन समर्थित नहीं है।")
+                    _isThinking.value = false
+                }
+                false
             }
         }
     }
@@ -1992,8 +2171,12 @@ $savedMemories
 
     fun executeConfirmedActions() {
         val rawList = _pendingActions.value?.filter { it.isEnabled } ?: return
-        val response = activeAssistantResponse ?: return
-        val assistantMsgId = activeAssistantMsgId ?: return
+        val response = activeAssistantResponse ?: AssistantResponse(
+            reply = "Restored Action Plan",
+            speak = "Executing restored actions.",
+            action = rawList.firstOrNull()?.action ?: "none"
+        )
+        val existingMsgId = activeAssistantMsgId
         
         // Cryptographically bind user consent to each action and transition to AUTHORIZED
         val confirmedList = rawList.map { pAction ->
@@ -2013,7 +2196,16 @@ $savedMemories
         
         activeWorkflowJob = viewModelScope.launch {
             _agentSteps.value = emptyList()
-            executeAgentWorkflow(confirmedList, response, assistantMsgId)
+            val targetMsgId = existingMsgId ?: repository.insertMessage(
+                ConversationMessage(
+                    role = "assistant",
+                    text = response.reply,
+                    isToolCall = true,
+                    sessionId = _currentSessionId.value,
+                    modelUsed = "Jarvis"
+                )
+            ).toInt()
+            executeAgentWorkflow(confirmedList, response, targetMsgId)
         }
     }
 
@@ -2055,9 +2247,13 @@ $savedMemories
             if (pAction.action == "update_device" || pAction.action == "control_device") {
                 val deviceId = pAction.editedParams["device_id"] ?: pAction.editedParams["device"]
                 if (deviceId != null) {
-                    val device = repository.getDeviceById(deviceId)
-                    if (device != null) {
-                        originalStatesBackup[deviceId] = device.state
+                    if (deviceId.equals("flashlight", ignoreCase = true) || deviceId.equals("torch", ignoreCase = true)) {
+                        originalStatesBackup[deviceId] = if (isTorchCurrentlyOn) "on" else "off"
+                    } else {
+                        val device = repository.getDeviceById(deviceId)
+                        if (device != null) {
+                            originalStatesBackup[deviceId] = device.state
+                        }
                     }
                 }
             }
@@ -2435,11 +2631,20 @@ $savedMemories
                 "update_device", "control_device" -> {
                     val deviceKey = params["device_id"] ?: params["device"] ?: return false
                     val originalState = originalStates[deviceKey] ?: "off"
-                    val device = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
-                    if (device != null) {
-                        repository.insertOrUpdateDevice(device.copy(state = originalState))
-                        true
-                    } else false
+                    if (deviceKey.equals("flashlight", ignoreCase = true) || deviceKey.equals("torch", ignoreCase = true)) {
+                        val (torchRestored, _) = setHardwareTorch(originalState.equals("on", ignoreCase = true))
+                        val device = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
+                        if (device != null) {
+                            repository.insertOrUpdateDevice(device.copy(state = originalState))
+                        }
+                        torchRestored
+                    } else {
+                        val device = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
+                        if (device != null) {
+                            repository.insertOrUpdateDevice(device.copy(state = originalState))
+                            true
+                        } else false
+                    }
                 }
                 "create_reminder" -> {
                     val title = params["title"] ?: return false
@@ -2552,13 +2757,22 @@ $savedMemories
                 "update_device", "control_device" -> {
                     val deviceKey = params["device_id"] ?: params["device"] ?: return Pair(false, "Device ID/name missing")
                     val state = params["state"] ?: return Pair(false, "Device state missing")
-                    val currentDevice = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
-                    if (currentDevice != null) {
-                        val updatedDevice = currentDevice.copy(state = state)
-                        repository.insertOrUpdateDevice(updatedDevice)
-                        Pair(true, null)
+                    if (deviceKey.equals("flashlight", ignoreCase = true) || deviceKey.equals("torch", ignoreCase = true)) {
+                        val (torchOk, torchErr) = setHardwareTorch(state.equals("on", ignoreCase = true))
+                        val currentDevice = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
+                        if (currentDevice != null && torchOk) {
+                            repository.insertOrUpdateDevice(currentDevice.copy(state = state))
+                        }
+                        Pair(torchOk, torchErr)
                     } else {
-                        Pair(false, "Device with ID/name $deviceKey not found")
+                        val currentDevice = repository.getDeviceById(deviceKey) ?: repository.getDeviceById(deviceKey.lowercase().replace(" ", "_"))
+                        if (currentDevice != null) {
+                            val updatedDevice = currentDevice.copy(state = state)
+                            repository.insertOrUpdateDevice(updatedDevice)
+                            Pair(true, null)
+                        } else {
+                            Pair(false, "Device with ID/name $deviceKey not found")
+                        }
                     }
                 }
                 "create_reminder" -> {
@@ -2570,7 +2784,6 @@ $savedMemories
                 "open_app" -> {
                     val app = params["app_package"] ?: ""
                     openDeviceApp(app)
-                    Pair(true, null)
                 }
                 "web_search" -> {
                     val query = params["query"] ?: return Pair(false, "Search query missing")
@@ -2645,27 +2858,106 @@ $savedMemories
         return matches.distinctBy { it.phoneNumber }
     }
 
-    private fun openDeviceApp(appName: String) {
+    private fun setHardwareTorch(enable: Boolean): Pair<Boolean, String?> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return Pair(false, "Torch control requires Android 6.0+")
+        }
+        return try {
+            val context = getApplication<Application>()
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                ?: return Pair(false, "CameraManager service unavailable")
+            var targetCameraId: String? = null
+            for (id in cm.cameraIdList) {
+                val chars = cm.getCameraCharacteristics(id)
+                val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                if (hasFlash) {
+                    targetCameraId = id
+                    val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                    if (facing == CameraCharacteristics.LENS_FACING_BACK) break
+                }
+            }
+            if (targetCameraId == null) {
+                return Pair(false, "No camera flash hardware available on this device")
+            }
+            cm.setTorchMode(targetCameraId, enable)
+            isTorchCurrentlyOn = enable
+            Pair(true, null)
+        } catch (e: Exception) {
+            Log.e("RohitAI", "Failed to toggle hardware torch: ${e.javaClass.simpleName}")
+            Pair(false, e.localizedMessage ?: "Failed to control flashlight")
+        }
+    }
+
+    private fun openDeviceApp(appName: String): Pair<Boolean, String?> {
         val context = getApplication<Application>()
-        val uriStr = when (appName.lowercase()) {
-            "youtube" -> "https://www.youtube.com"
-            "maps" -> "geo:0,0?q=maps"
-            "gmail" -> "mailto:"
-            "chrome" -> "https://www.google.com"
-            "settings" -> "package:android.settings.SETTINGS"
-            else -> "https://www.google.com"
+        val target = appName.trim().lowercase()
+        if (target.isEmpty()) {
+            return Pair(false, "App name is empty")
         }
 
-        try {
-            val intent = if (appName.lowercase() == "settings") {
-                Intent(android.provider.Settings.ACTION_SETTINGS)
-            } else {
-                Intent(Intent.ACTION_VIEW, Uri.parse(uriStr))
+        val pm = context.packageManager
+
+        val knownPackages = mapOf(
+            "whatsapp" to "com.whatsapp",
+            "chrome" to "com.android.chrome",
+            "youtube" to "com.google.android.youtube",
+            "maps" to "com.google.android.apps.maps",
+            "gmail" to "com.google.android.gm",
+            "telegram" to "org.telegram.messenger",
+            "instagram" to "com.instagram.android",
+            "spotify" to "com.spotify.music"
+        )
+
+        val directIntent: Intent? = when (target) {
+            "settings", "सेटिंग्स" -> Intent(Settings.ACTION_SETTINGS)
+            "camera", "कैमरा" -> Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+            "clock", "alarm", "अलार्म" -> Intent(AlarmClock.ACTION_SHOW_ALARMS)
+            "phone", "dialer", "call" -> Intent(Intent.ACTION_DIAL)
+            "messages", "sms" -> Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_MESSAGING)
+            "contacts", "संपर्क" -> Intent(Intent.ACTION_VIEW, ContactsContract.Contacts.CONTENT_URI)
+            "calculator", "कैलकुलेटर" -> Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_CALCULATOR)
+            else -> {
+                val mappedPkg = knownPackages[target]
+                val pkgIntent = mappedPkg?.let { pm.getLaunchIntentForPackage(it) }
+                if (pkgIntent != null) {
+                    pkgIntent
+                } else {
+                    // Search installed launchable apps by label or package name
+                    val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                    val resolvedApps = pm.queryIntentActivities(mainIntent, 0)
+                    val matchedResolve = resolvedApps.firstOrNull { info ->
+                        val label = info.loadLabel(pm).toString().lowercase()
+                        val pkg = info.activityInfo.packageName.lowercase()
+                        label == target || label.contains(target) || pkg.contains(target)
+                    }
+                    if (matchedResolve != null) {
+                        pm.getLaunchIntentForPackage(matchedResolve.activityInfo.packageName)
+                    } else if (isNetworkAvailable()) {
+                        when (target) {
+                            "youtube" -> Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com"))
+                            "maps" -> Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=maps"))
+                            "gmail" -> Intent(Intent.ACTION_VIEW, Uri.parse("mailto:"))
+                            "chrome" -> Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com"))
+                            else -> null
+                        }
+                    } else {
+                        null
+                    }
+                }
             }
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            Log.e("RohitAI", "Failed to launch app: $appName", e)
+        }
+
+        return if (directIntent != null) {
+            try {
+                directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(directIntent)
+                Pair(true, null)
+            } catch (e: Exception) {
+                Log.e("RohitAI", "Failed to launch app: ${e.javaClass.simpleName}")
+                Pair(false, "Unable to launch $appName: ${e.localizedMessage ?: "No activity handler"}")
+            }
+        } else {
+            Pair(false, "App '$appName' is not installed on this device")
         }
     }
 
@@ -2887,6 +3179,15 @@ $savedMemories
 
     override fun onCleared() {
         super.onCleared()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            torchCallback?.let { cb ->
+                try {
+                    val cm = getApplication<Application>().getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                    cm?.unregisterTorchCallback(cb)
+                } catch (_: Exception) {
+                }
+            }
+        }
         textToSpeech?.shutdown()
         speechRecognizer?.destroy()
     }

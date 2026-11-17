@@ -554,6 +554,11 @@ class ExampleUnitTest {
     @Test
     fun testPreConsentPlanningGateBlocksUnauthorizedPlanBeforeConsentUI() {
         val allowedPlanActions = com.example.viewmodel.AssistantViewModel.ALLOWED_PLAN_ACTIONS
+        val expectedServerTools = setOf("send_sms", "update_device", "create_reminder", "open_app", "save_memory")
+        assertEquals("ALLOWED_PLAN_ACTIONS must match exact 5 server tools", expectedServerTools, allowedPlanActions)
+        assertEquals("JarvisSseClient.ALLOWED_TOOLS must match ALLOWED_PLAN_ACTIONS", expectedServerTools, com.example.jarvis.JarvisSseClient.ALLOWED_TOOLS)
+        assertFalse("update_policy must never be allowed", "update_policy" in allowedPlanActions)
+        assertFalse("delete_data must never be allowed", "delete_data" in allowedPlanActions)
 
         // Plan with unauthorized action 'delete_data'
         val rawPlan = listOf(
@@ -587,14 +592,12 @@ class ExampleUnitTest {
 
     @Test
     fun testJarvisZeroTrustBufferingHoldsActionsUntilDoneEvent() {
-        // Simulating the exact event stream behavior of processUserQueryWithJarvis
-        val bufferedActions = mutableListOf<ProposedAction>()
-        var pendingConsentActions: List<ProposedAction>? = null
+        val streamBuffer = com.example.jarvis.JarvisStreamEventBuffer()
 
         // Step 1: TextDelta arrives
-        val event1 = com.example.jarvis.JarvisServerEvent.TextDelta("Main aapke liye SMS bhej raha hoon...")
-        assertTrue(event1.delta.isNotEmpty())
-        assertNull("Pending actions must remain null during text streaming", pendingConsentActions)
+        streamBuffer.onTextDelta("Main aapke liye SMS bhej raha hoon...")
+        assertNull("Pending actions must remain null during text streaming", streamBuffer.pendingActions)
+        assertTrue(streamBuffer.bufferedActions.isEmpty())
 
         // Step 2: Action event arrives from server
         val actionEvent = com.example.jarvis.JarvisServerEvent.Action(
@@ -605,61 +608,23 @@ class ExampleUnitTest {
             requiresConsent = true,
             allowParallel = false
         )
-        bufferedActions.add(
-            ProposedAction(
-                id = actionEvent.actionId,
-                action = actionEvent.tool,
-                description = "Send SMS to Rahul",
-                originalParams = actionEvent.args,
-                editedParams = actionEvent.args,
-                riskLevel = RiskLevel.HIGH
-            )
-        )
+        streamBuffer.onAction(actionEvent)
 
         // CRITICAL INVARIANT: Action is buffered in memory, but NOT dispatched to UI or consent state
-        assertEquals(1, bufferedActions.size)
-        assertNull("CRITICAL: Actions must NOT surface to consent card before terminal Done event!", pendingConsentActions)
+        assertEquals(1, streamBuffer.bufferedActions.size)
+        assertNull("CRITICAL: Actions must NOT surface to pendingActions before terminal Done event!", streamBuffer.pendingActions)
 
         // Step 3: Terminal Done event arrives
-        val doneEvent = com.example.jarvis.JarvisServerEvent.Done
-        assertNotNull(doneEvent)
-
-        // Pre-consent gate validation runs upon Done
-        val disallowed = bufferedActions.find { it.action !in AssistantViewModel.ALLOWED_PLAN_ACTIONS }
-        assertNull("Allowed tool send_sms must pass pre-consent gate", disallowed)
-
-        // Only after Done + gate pass are actions promoted to pending consent
-        pendingConsentActions = bufferedActions.toList()
-        assertNotNull("Actions promoted to consent card only after Done event", pendingConsentActions)
-        assertEquals(1, pendingConsentActions?.size)
-        assertEquals("send_sms", pendingConsentActions?.first()?.action)
+        val success = streamBuffer.onDone()
+        assertTrue("onDone must return true for valid allowed actions", success)
+        assertNotNull("Actions promoted to pendingActions only after Done event", streamBuffer.pendingActions)
+        assertEquals(1, streamBuffer.pendingActions?.size)
+        assertEquals("send_sms", streamBuffer.pendingActions?.first()?.action)
     }
 
     @Test
     fun testJarvisErrorEventWipesBufferedActionsAndPlanWithoutConsentCard() {
-        val bufferedActions = mutableListOf<ProposedAction>()
-        val bufferedPlan = mutableListOf<com.example.jarvis.PlannedStep>()
-        var pendingConsentActions: List<ProposedAction>? = null
-
-        // 1. Plan arrives
-        bufferedPlan.add(com.example.jarvis.PlannedStep(stepNumber = 1, tool = "send_sms", description = "Send SMS"))
-        assertEquals(1, bufferedPlan.size)
-
-        // 2. Action arrives and is buffered
-        bufferedActions.add(
-            ProposedAction(
-                id = "act_123",
-                action = "send_sms",
-                description = "Send SMS to Doctor",
-                originalParams = mapOf("recipient" to "102"),
-                editedParams = mapOf("recipient" to "102"),
-                riskLevel = RiskLevel.HIGH
-            )
-        )
-        assertEquals(1, bufferedActions.size)
-        assertNull(pendingConsentActions)
-
-        // 3. Error event arrives - test ALL 9 production server error codes plus client network/security codes
+        // Test ALL 9 production server error codes plus client transport codes
         val serverErrorCodes = listOf(
             "UNAUTHORIZED",
             "RATE_LIMITED",
@@ -674,17 +639,47 @@ class ExampleUnitTest {
             "NETWORK_ERROR",
             "SECURITY_VIOLATION"
         )
-        for (errCode in serverErrorCodes) {
-            val errorEvent = com.example.jarvis.JarvisServerEvent.Error(code = errCode, message = "Failed with $errCode")
-            
-            // Error handling wipes all buffers
-            bufferedActions.clear()
-            bufferedPlan.clear()
-            pendingConsentActions = null
 
-            assertTrue("Buffered actions must be strictly cleared on error $errCode", bufferedActions.isEmpty())
-            assertTrue("Buffered plan must be strictly cleared on error $errCode", bufferedPlan.isEmpty())
-            assertNull("No consent card must ever be created when stream encounters error $errCode", pendingConsentActions)
+        for (errCode in serverErrorCodes) {
+            val streamBuffer = com.example.jarvis.JarvisStreamEventBuffer()
+
+            // 1. Plan arrives
+            streamBuffer.onPlan(
+                com.example.jarvis.JarvisServerEvent.Plan(
+                    planId = "plan_$errCode",
+                    steps = listOf(com.example.jarvis.PlannedStep(stepNumber = 1, tool = "send_sms", description = "Send SMS"))
+                )
+            )
+            assertEquals(1, streamBuffer.bufferedPlanSteps.size)
+
+            // 2. Action arrives and is buffered
+            streamBuffer.onAction(
+                com.example.jarvis.JarvisServerEvent.Action(
+                    actionId = "act_$errCode",
+                    tool = "send_sms",
+                    args = mapOf("recipient" to "102"),
+                    riskLevel = "HIGH",
+                    requiresConsent = true,
+                    allowParallel = false
+                )
+            )
+            assertEquals(1, streamBuffer.bufferedActions.size)
+            assertNull(streamBuffer.pendingActions)
+
+            // 3. Error event arrives directly invoking production onError()
+            val errorEvent = com.example.jarvis.JarvisServerEvent.Error(code = errCode, message = "Failed with $errCode")
+            streamBuffer.onError(errorEvent)
+
+            // Assert production buffer state guarantees
+            assertTrue("Production isErrorState must be true for $errCode", streamBuffer.isErrorState)
+            assertTrue("Buffered actions must be strictly cleared on error $errCode", streamBuffer.bufferedActions.isEmpty())
+            assertTrue("Buffered plan steps must be strictly cleared on error $errCode", streamBuffer.bufferedPlanSteps.isEmpty())
+            assertNull("No consent card / pendingActions must ever exist on error $errCode", streamBuffer.pendingActions)
+
+            // Invariant: Even if onDone() arrives after onError, pendingActions remains strictly null
+            val doneResult = streamBuffer.onDone()
+            assertFalse("onDone must return false when in error state for $errCode", doneResult)
+            assertNull("pendingActions must remain null even if onDone is called after error $errCode", streamBuffer.pendingActions)
         }
     }
 
@@ -711,5 +706,130 @@ class ExampleUnitTest {
         assertFalse("Special characters like !@# must fail", com.example.jarvis.SecureTokenManager.isValidTokenFormat(invalidChars))
         assertFalse("Spaces must fail", com.example.jarvis.SecureTokenManager.isValidTokenFormat(withSpaces))
     }
+
+    @Test
+    fun testRecoveryPlanGateRejectsUnauthorizedToolViaProductionValidator() {
+        val validRecovered = listOf(
+            ProposedAction(
+                id = "rec_1",
+                action = "send_sms",
+                description = "Send SMS",
+                originalParams = mapOf("recipient" to "9876543210", "message" to "Hello"),
+                editedParams = mapOf("recipient" to "9876543210", "message" to "Hello"),
+                riskLevel = RiskLevel.HIGH
+            )
+        )
+        val (validOk, validBlocked) = AssistantViewModel.validatePlanActions(validRecovered)
+        assertTrue("Valid recovered plan must pass gate", validOk)
+        assertNull(validBlocked)
+
+        val tamperedRecovered = listOf(
+            ProposedAction(
+                id = "rec_1",
+                action = "send_sms",
+                description = "Send SMS",
+                originalParams = mapOf("recipient" to "9876543210", "message" to "Hello"),
+                editedParams = mapOf("recipient" to "9876543210", "message" to "Hello"),
+                riskLevel = RiskLevel.HIGH
+            ),
+            ProposedAction(
+                id = "rec_2",
+                action = "update_policy",
+                description = "Bypass policy",
+                originalParams = emptyMap(),
+                editedParams = emptyMap(),
+                riskLevel = RiskLevel.CRITICAL
+            )
+        )
+        val (tamperedOk, tamperedBlocked) = AssistantViewModel.validatePlanActions(tamperedRecovered)
+        assertFalse("Tampered recovered plan containing update_policy must be rejected", tamperedOk)
+        assertEquals("update_policy", tamperedBlocked)
+    }
+
+    @Test
+    fun testLocalIntentRouterOfflineCommandsAndConsentGateCompliance() {
+        val router = com.example.jarvis.LocalIntentRouter()
+        val mockDevices = listOf(
+            com.example.database.SmartDevice(
+                id = "light_living_room",
+                name = "Living Room Light",
+                type = "light",
+                state = "off",
+                room = "Living Room"
+            ),
+            com.example.database.SmartDevice(
+                id = "door_front",
+                name = "Front Door",
+                type = "lock",
+                state = "locked",
+                room = "Entrance"
+            )
+        )
+
+        // 1. Flashlight ON (English)
+        val flashOn = router.parseAndRoute("turn on flashlight", mockDevices)
+        assertTrue(flashOn is com.example.jarvis.LocalIntentResult.Success)
+        val flashOnRes = flashOn as com.example.jarvis.LocalIntentResult.Success
+        assertEquals(1, flashOnRes.actions.size)
+        assertEquals("update_device", flashOnRes.actions[0].action)
+        assertEquals("flashlight", flashOnRes.actions[0].editedParams["device_id"])
+        assertEquals("on", flashOnRes.actions[0].editedParams["state"])
+        assertEquals(com.example.certification.ActionState.PROPOSED, flashOnRes.actions[0].state)
+        assertTrue(AssistantViewModel.validatePlanActions(flashOnRes.actions).first)
+
+        // 2. Flashlight OFF (Hindi/Hinglish)
+        val flashOffHi = router.parseAndRoute("टॉर्च बंद करो", mockDevices)
+        assertTrue(flashOffHi is com.example.jarvis.LocalIntentResult.Success)
+        val flashOffRes = flashOffHi as com.example.jarvis.LocalIntentResult.Success
+        assertEquals("update_device", flashOffRes.actions[0].action)
+        assertEquals("off", flashOffRes.actions[0].editedParams["state"])
+        assertTrue(AssistantViewModel.validatePlanActions(flashOffRes.actions).first)
+
+        // 3. Open App (English + Hindi)
+        val openWhatsapp = router.parseAndRoute("open whatsapp", mockDevices)
+        assertTrue(openWhatsapp is com.example.jarvis.LocalIntentResult.Success)
+        val openWaRes = openWhatsapp as com.example.jarvis.LocalIntentResult.Success
+        assertEquals("open_app", openWaRes.actions[0].action)
+        assertEquals("whatsapp", openWaRes.actions[0].editedParams["app_package"])
+        assertTrue(AssistantViewModel.validatePlanActions(openWaRes.actions).first)
+
+        val openSettingsHi = router.parseAndRoute("Settings खोलो", mockDevices)
+        assertTrue(openSettingsHi is com.example.jarvis.LocalIntentResult.Success)
+        val openSetRes = openSettingsHi as com.example.jarvis.LocalIntentResult.Success
+        assertEquals("open_app", openSetRes.actions[0].action)
+        assertEquals("Settings", openSetRes.actions[0].editedParams["app_package"])
+        assertTrue(AssistantViewModel.validatePlanActions(openSetRes.actions).first)
+
+        // 4. Offline Reminder -> create_reminder
+        val reminder = router.parseAndRoute("remind me to buy milk at 6pm", mockDevices)
+        assertTrue(reminder is com.example.jarvis.LocalIntentResult.Success)
+        val reminderRes = reminder as com.example.jarvis.LocalIntentResult.Success
+        assertEquals("create_reminder", reminderRes.actions[0].action)
+        assertEquals("buy milk at 6pm", reminderRes.actions[0].editedParams["title"])
+        assertEquals("Offline", reminderRes.actions[0].editedParams["category"])
+        assertTrue(AssistantViewModel.validatePlanActions(reminderRes.actions).first)
+
+        // 5. Offline Memory -> save_memory
+        val memory = router.parseAndRoute("remember that my bike key is on the desk", mockDevices)
+        assertTrue(memory is com.example.jarvis.LocalIntentResult.Success)
+        val memoryRes = memory as com.example.jarvis.LocalIntentResult.Success
+        assertEquals("save_memory", memoryRes.actions[0].action)
+        assertEquals("my bike key is on the desk", memoryRes.actions[0].editedParams["fact"])
+        assertTrue(AssistantViewModel.validatePlanActions(memoryRes.actions).first)
+
+        // 6. Known SmartDevice -> update_device
+        val deviceOn = router.parseAndRoute("turn on living room light", mockDevices)
+        assertTrue(deviceOn is com.example.jarvis.LocalIntentResult.Success)
+        val deviceOnRes = deviceOn as com.example.jarvis.LocalIntentResult.Success
+        assertEquals("update_device", deviceOnRes.actions[0].action)
+        assertEquals("light_living_room", deviceOnRes.actions[0].editedParams["device_id"])
+        assertEquals("on", deviceOnRes.actions[0].editedParams["state"])
+        assertTrue(AssistantViewModel.validatePlanActions(deviceOnRes.actions).first)
+
+        // 7. General open-ended queries must return NotHandled
+        assertTrue(router.parseAndRoute("what is quantum computing?", mockDevices) is com.example.jarvis.LocalIntentResult.NotHandled)
+        assertTrue(router.parseAndRoute("   ", mockDevices) is com.example.jarvis.LocalIntentResult.NotHandled)
+    }
 }
+
 

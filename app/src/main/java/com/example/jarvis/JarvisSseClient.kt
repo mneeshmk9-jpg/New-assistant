@@ -91,16 +91,16 @@ class JarvisSseClient(
         }
 
         val historyArray = JSONArray()
-        for (turn in request.history) {
+        for (turn in request.history.takeLast(10)) {
             val turnObj = JSONObject().apply {
                 put("role", turn.role)
-                put("text", turn.text)
+                put("text", turn.text.take(1500))
             }
             historyArray.put(turnObj)
         }
 
         val reqJson = JSONObject().apply {
-            put("text", request.text)
+            put("text", request.text.take(4000))
             put("history", historyArray)
         }
 
@@ -204,7 +204,8 @@ class JarvisSseClient(
                         val stepObj = stepsArray.getJSONObject(i)
                         val tool = stepObj.optString("tool")
                         if (tool !in ALLOWED_TOOLS) {
-                            Log.w(TAG, "Rejected plan containing unauthorized tool: $tool")
+                            val sanitizedTool = tool.replace(Regex("[^a-zA-Z0-9_]"), "").take(40)
+                            Log.w(TAG, "Rejected plan containing unauthorized tool: $sanitizedTool")
                             return null
                         }
                         stepsList.add(
@@ -221,7 +222,8 @@ class JarvisSseClient(
                     val actionId = root.optString("actionId", "act_${System.currentTimeMillis()}")
                     val tool = root.optString("tool")
                     if (tool !in ALLOWED_TOOLS) {
-                        Log.w(TAG, "Rejected action with disallowed tool: $tool")
+                        val sanitizedTool = tool.replace(Regex("[^a-zA-Z0-9_]"), "").take(40)
+                        Log.w(TAG, "Rejected action with disallowed tool: $sanitizedTool")
                         return null
                     }
 
