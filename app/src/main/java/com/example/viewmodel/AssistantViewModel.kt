@@ -867,7 +867,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun handleUtteranceFinished(utteranceId: String?) {
-        if (utteranceId != null && utteranceId.startsWith("StreamSpeech_")) {
+        if (utteranceId != null && (utteranceId.startsWith("StreamSpeech_") || utteranceId.startsWith("JarvisStreamSpeech_"))) {
             activeUtterances.remove(utteranceId)
             if (activeUtterances.isEmpty() && streamFinished) {
                 _isSpeaking.value = false
@@ -2163,7 +2163,7 @@ $savedMemories
                 val fact = params["fact"]
                 if (fact != null) {
                     repository.insertMemory(fact)
-                    Log.d("RohitAI", "Saved memory: $fact")
+                    Log.d("RohitAI", "Saved memory (${fact.length} chars)")
                 }
             }
         }
@@ -2738,9 +2738,7 @@ $savedMemories
                         if (lookup != null) {
                             phoneNumber = lookup
                         } else {
-                            // Graceful fallback for testing/dummy simulation if contact not found in real database
-                            phoneNumber = "5556" // Emulated standard Android port/number
-                            Log.d("RohitAI", "Contact $recipient not found, falling back to dummy SMS number $phoneNumber")
+                            return Pair(false, "Contact not found: $recipient")
                         }
                     }
 

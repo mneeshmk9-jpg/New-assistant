@@ -8,6 +8,7 @@ import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.Body
+import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Query
 import retrofit2.http.Streaming
@@ -97,14 +98,14 @@ data class StreamChunk(
 interface GeminiApiService {
     @POST("v1beta/models/gemini-3.5-flash:generateContent")
     suspend fun generateContent(
-        @Query("key") apiKey: String,
+        @Header("x-goog-api-key") apiKey: String,
         @Body request: GenerateContentRequest
     ): GenerateContentResponse
 
     @Streaming
     @POST("v1beta/models/gemini-3.5-flash:streamGenerateContent")
     suspend fun streamGenerateContent(
-        @Query("key") apiKey: String,
+        @Header("x-goog-api-key") apiKey: String,
         @Body request: GenerateContentRequest,
         @Query("alt") alt: String = "sse"
     ): ResponseBody
@@ -117,9 +118,15 @@ object RetrofitClient {
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
-        .addInterceptor(HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
-        })
+        .apply {
+            if (com.example.BuildConfig.DEBUG) {
+                addInterceptor(HttpLoggingInterceptor().apply {
+                    level = HttpLoggingInterceptor.Level.BASIC
+                    redactHeader("x-goog-api-key")
+                    redactHeader("Authorization")
+                })
+            }
+        }
         .build()
 
     val service: GeminiApiService by lazy {
